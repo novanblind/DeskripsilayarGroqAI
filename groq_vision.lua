@@ -37,9 +37,8 @@ local mainHandler = Handler(Looper.getMainLooper())
 -- ====================================================================
 local CURRENT_VERSION = "2.0.0"
 
--- Ganti tautan di bawah ini dengan tautan RAW script Anda di GitHub:
--- Format: https://raw.githubusercontent.com/<username>/<repo>/<branch>/<nama_file>.lua
-local GITHUB_RAW_URL = "https://raw.githubusercontent.com/USERNAME/REPO_NAME/main/script.lua"
+-- URL RAW GitHub repositori Anda
+local GITHUB_RAW_URL = "https://raw.githubusercontent.com/novanblind/DeskripsilayarGroqAI/main/groq_vision.lua"
 
 -- Kunci API Bawaan
 local defaultApiKey = "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"
@@ -106,6 +105,14 @@ local function getScriptFilePath()
   if src and src:sub(1, 1) == "@" then
     return src:sub(2)
   end
+  -- Fallback jika path tidak terbaca langsung dari debug
+  local fallbackPaths = {
+    "/sdcard/jieshuo/plugin/Deskripsi Layar Groq/main.lua",
+    "/sdcard/jieshuo/plugin/DeskripsilayarGroqAI/groq_vision.lua"
+  }
+  for _, path in ipairs(fallbackPaths) do
+    if File(path).exists() then return path end
+  end
   return nil
 end
 
@@ -134,6 +141,9 @@ local function saveNewScript(newCode, targetPath)
   local success = false
   pcall(function()
     local f = File(targetPath)
+    if not f.getParentFile().exists() then
+      f.getParentFile().mkdirs()
+    end
     local fos = FileOutputStream(f)
     fos.write(String(newCode).getBytes("UTF-8"))
     fos.flush()
@@ -164,7 +174,9 @@ checkAppUpdate = function(isManual)
       local errDetail = ""
 
       pcall(function()
-        local url = URL(GITHUB_RAW_URL)
+        -- Tambahkan parameter waktu (?t=...) agar selalu mengambil revisi terbaru (anti-cache CDN)
+        local fetchUrl = GITHUB_RAW_URL .. "?t=" .. tostring(os.time())
+        local url = URL(fetchUrl)
         conn = url.openConnection()
         conn.setRequestMethod("GET")
         conn.setInstanceFollowRedirects(true)
