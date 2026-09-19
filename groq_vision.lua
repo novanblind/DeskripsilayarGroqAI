@@ -1,5 +1,7 @@
 require "import"
 import "android.graphics.Bitmap"
+import "android.graphics.Canvas"
+import "android.graphics.Paint"
 import "android.util.Base64"
 import "java.io.ByteArrayOutputStream"
 import "org.json.JSONObject"
@@ -37,7 +39,7 @@ local mainHandler = Handler(Looper.getMainLooper())
 -- ====================================================================
 -- KONFIGURASI VERSI & GITHUB AUTO-UPDATE
 -- ====================================================================
-local CURRENT_VERSION = "2.0.2"
+local CURRENT_VERSION = "2.1.4"
 local GITHUB_RAW_URL = "https://raw.githubusercontent.com/novanblind/DeskripsilayarGroqAI/main/groq_vision.lua"
 
 local defaultApiKey = ""
@@ -50,6 +52,14 @@ Jika gambar berisi surat, dokumen, formulir, poster, papan, atau teks lainnya, b
 
 Jangan gunakan pembuka umum seperti 'Gambar ini menunjukkan...', penomoran, bullet point, subjudul, atau kategori. Dasarkan setiap pernyataan pada hal yang benar-benar terlihat; nyatakan ketidakpastian jika diperlukan. Pastikan isi surat atau dokumen disampaikan secara lengkap sebelum memberikan deskripsi visual dan kesan suasana keseluruhan.]]
 
+local defaultVideoInstruction = [[Deskripsikan video secara berurutan secara jelas, natural, dan profesional dalam bahasa Indonesia. Susun narasi visual yang mengalir dari elemen paling dominan ke objek, karakter, lingkungan, dan detail sekitarnya. Jelaskan warna, bentuk, ukuran, tekstur, posisi, pencahayaan, suasana, komposisi, serta hubungan antarelemen tanpa berlebihan atau mengarang informasi. Abaikan elemen antarmuka ponsel yang tidak relevan, seperti indikator sinyal, baterai, waktu, notifikasi, atau ikon sistem lainnya, kecuali jika secara khusus diminta untuk menjelaskannya.
+
+Jika terdapat manusia atau karakter, gambarkan penampilan, pakaian, ekspresi, arah pandangan, gestur, dan kesan emosional yang tampak. Jelaskan pula kedalaman ruang, objek di depan, tengah, dan belakang, serta cara komposisi mengarahkan perhatian.
+
+Jika gambar berisi surat, dokumen, formulir, poster, papan, atau teks lainnya, bacakan dan transkripsikan seluruh teks yang terlihat secara akurat. Pertahankan urutan pembacaan sesuai tata letak gambar. Jika ini adalah urutan gambar (video), jelaskan pergerakan dan perubahan yang terjadi dari awal hingga akhir dengan alur cerita yang masuk akal.
+
+Jangan gunakan pembuka umum seperti 'Gambar ini menunjukkan...', penomoran, bullet point, subjudul, atau kategori. Dasarkan setiap pernyataan pada hal yang benar-benar terlihat; nyatakan ketidakpastian jika diperlukan. Pastikan isi surat atau dokumen disampaikan secara lengkap sebelum memberikan deskripsi visual dan kesan suasana keseluruhan.]]
+
 local defaultTextInstruction = [[Ekstrak dan transkripsikan seluruh teks yang terlihat pada tampilan layar ini secara akurat, lengkap, dan berurutan dari atas ke bawah sesuai tata letak aslinya.
 
 DILARANG memberikan kata pengantar, penjelasan, pembuka (seperti "Teks pada layar adalah:", "Berikut teksnya:"), penutup, ataupun deskripsi visual mengenai elemen layar.
@@ -59,7 +69,7 @@ Tampilkan HANYA teks asli yang tertulis di layar persis apa adanya tanpa basa-ba
 local sp = service.getSharedPreferences("groq_vision_desc_config", Context.MODE_PRIVATE)
 
 -- ====================================================================
--- MANAJEMEN FILE LOKAL & KUNCI API
+-- MANAJEMEN PENGATURAN & KUNCI API
 -- ====================================================================
 local function getScriptFilePath()
   local src = debug.getinfo(1, "S").source
@@ -140,11 +150,17 @@ local function setModelName(m) sp.edit().putString("model_name", m).apply() end
 local function getScanMode() return sp.getString("scan_feature_mode", "visual_desc") end
 local function setScanMode(m) sp.edit().putString("scan_feature_mode", m).apply() end
 
+local function getVideoDuration() return sp.getInt("video_duration", 10) end
+local function setVideoDuration(d) sp.edit().putInt("video_duration", d).apply() end
+
 local function getResolutionMode() return sp.getString("scan_resolution", "720") end
 local function setResolutionMode(r) sp.edit().putString("scan_resolution", r).apply() end
 
 local function getImageInstruction() return sp.getString("custom_instruction", defaultImageInstruction) end
 local function setImageInstruction(i) sp.edit().putString("custom_instruction", i).apply() end
+
+local function getVideoInstruction() return sp.getString("custom_video_instruction", defaultVideoInstruction) end
+local function setVideoInstruction(i) sp.edit().putString("custom_video_instruction", i).apply() end
 
 local function getTextInstruction() return sp.getString("custom_text_instruction", defaultTextInstruction) end
 local function setTextInstruction(i) sp.edit().putString("custom_text_instruction", i).apply() end
@@ -225,25 +241,26 @@ checkAppUpdate = function()
 end
 
 -- ====================================================================
--- PENGOLAHAN GAMBAR (RESOLUSI DAPAT DIATUR)
+-- PENGOLAHAN GAMBAR (KOMPRESI & BASE64 DENGAN OPTIMASI RESOLUSI)
 -- ====================================================================
-local function bitmapToBase64(bitmap)
+local function bitmapToBase64(bitmap, isVideoMode)
   local resMode = getResolutionMode()
   local targetQuality = 75
   local limit = 720
 
+  -- Pada mode video, resolusi diturunkan satu tingkat agar token & memori tetap aman
   if resMode == "original" then
-    limit = 0
-    targetQuality = 85
+    limit = isVideoMode and 720 or 0
+    targetQuality = isVideoMode and 75 or 85
   elseif resMode == "1080" then
-    limit = 1080
-    targetQuality = 80
+    limit = isVideoMode and 640 or 1080
+    targetQuality = isVideoMode and 70 or 80
   elseif resMode == "720" then
-    limit = 720
-    targetQuality = 75
+    limit = isVideoMode and 480 or 720
+    targetQuality = isVideoMode and 70 or 75
   elseif resMode == "480" then
-    limit = 480
-    targetQuality = 70
+    limit = isVideoMode and 360 or 480
+    targetQuality = isVideoMode and 65 or 70
   end
 
   local w = bitmap.getWidth()
@@ -285,8 +302,36 @@ local function bitmapToBase64(bitmap)
   return base64Str
 end
 
+local function captureSingleFrame(callback)
+  pcall(function()
+    service.takeScreenshot(Display.DEFAULT_DISPLAY, service.getMainExecutor(), TakeScreenshotCallback{
+      onSuccess = function(screenshotResult)
+        local bmp = nil
+        pcall(function()
+          local hwBuffer = screenshotResult.getHardwareBuffer()
+          local colorSpace = screenshotResult.getColorSpace()
+          local rawBmp = Bitmap.wrapHardwareBuffer(hwBuffer, colorSpace)
+          if rawBmp then
+            bmp = rawBmp.copy(Bitmap.Config.ARGB_8888, false)
+            pcall(function() rawBmp.recycle() end)
+          end
+          if hwBuffer then hwBuffer.close() end
+        end)
+        if bmp then
+          callback(true, bmp)
+        else
+          callback(false, "Gagal mengekstrak bitmap dari screenshot.")
+        end
+      end,
+      onFailure = function(errorCode)
+        callback(false, "Gagal mengambil tangkapan layar. Kode: " .. tostring(errorCode))
+      end
+    })
+  end)
+end
+
 -- ====================================================================
--- GROQ API ASINKRON BEBAS KUNCI LUA (KURSOR BEBAS BERGERAK)
+-- GROQ API ASINKRON BEBAS KUNCI LUA
 -- ====================================================================
 local function sendGroqChat(userText, mediaData, onComplete)
   local apiKey = getApiKey()
@@ -316,7 +361,7 @@ local function sendGroqChat(userText, mediaData, onComplete)
   local jsonPayload = JSONObject()
   jsonPayload.put("model", activeModel)
   jsonPayload.put("temperature", 0.1)
-  jsonPayload.put("max_tokens", 1500)
+  jsonPayload.put("max_tokens", 800)
 
   local messagesArray = JSONArray()
   if currentSysInstruction and currentSysInstruction ~= "" then
@@ -354,7 +399,6 @@ local function sendGroqChat(userText, mediaData, onComplete)
   local payloadStr = jsonPayload.toString()
   local endpoint = "https://api.groq.com/openai/v1/chat/completions"
 
-  -- Konversi Header ke HashMap Java murni agar dapat diproses oleh engine C/Java tanpa error tipe data
   local headerMap = HashMap()
   headerMap.put("Content-Type", "application/json; charset=UTF-8")
   headerMap.put("Authorization", "Bearer " .. apiKey)
@@ -386,7 +430,6 @@ local function sendGroqChat(userText, mediaData, onComplete)
             if ok then return end
           end
 
-          -- Pengulangan otomatis hingga 3 kali
           if attempt < maxRetries then
             mainHandler.postDelayed(Runnable{
               run = function()
@@ -409,12 +452,10 @@ local function sendGroqChat(userText, mediaData, onComplete)
       })
     end
 
-    -- Panggil Http.post bawaan Java yang sepenuhnya non-blocking terhadap UI
     local httpEngine = http or Http
     local dispatched = false
 
     if httpEngine and httpEngine.post then
-      -- Signature 1: (url, data, headerMap, callback)
       local ok = pcall(function()
         httpEngine.post(endpoint, payloadStr, headerMap, function(code, content)
           handleResult(code, content)
@@ -423,7 +464,6 @@ local function sendGroqChat(userText, mediaData, onComplete)
       if ok then
         dispatched = true
       else
-        -- Signature 2: (url, data, cookie, charset, headerMap, callback)
         ok = pcall(function()
           httpEngine.post(endpoint, payloadStr, "", "UTF-8", headerMap, function(code, content)
             handleResult(code, content)
@@ -433,7 +473,6 @@ local function sendGroqChat(userText, mediaData, onComplete)
       end
     end
 
-    -- Fallback aman jika engine http.post tidak terpasang
     if not dispatched then
       Thread(Runnable{
         run = function()
@@ -543,7 +582,13 @@ showChatDialog = function()
   inputLayout.addView(btnSend)
   layout.addView(inputLayout)
 
-  local dialogTitle = (getScanMode() == "text_ocr") and "Hasil Pindai Teks Layar" or "Hasil Deskripsi Layar"
+  local mode = getScanMode()
+  local dialogTitle = "Hasil Deskripsi Layar"
+  if mode == "text_ocr" then
+    dialogTitle = "Hasil Pindai Teks Layar"
+  elseif mode == "video_desc" then
+    dialogTitle = "Hasil Deskripsi Video"
+  end
 
   local builder = AlertDialog.Builder(service)
     .setTitle(dialogTitle)
@@ -636,12 +681,20 @@ end
 
 local function showScanModeDialog()
   local modeOptions = {
-    "Deskripsi Layar (Visual, Objek & Teks)",
-    "Pindai Teks Saja (Hanya Ekstrak Teks Tanpa Basa-Basi)"
+    "Deskripsi Layar (Foto Tunggal)",
+    "Deskripsi Video (Kompilasi Kronologis 3 Frame)",
+    "Pindai Teks Saja (Hanya Ekstrak Teks)"
   }
 
   local currentMode = getScanMode()
-  local selectedIndex = (currentMode == "text_ocr") and 1 or 0
+  local selectedIndex = 0
+  if currentMode == "video_desc" then
+    selectedIndex = 1
+  elseif currentMode == "text_ocr" then
+    selectedIndex = 2
+  else
+    selectedIndex = 0
+  end
 
   local builder = AlertDialog.Builder(service)
     .setTitle("Pilih Mode Pemindaian")
@@ -650,9 +703,46 @@ local function showScanModeDialog()
       if which == 0 then
         setScanMode("visual_desc")
         service.speak("Mode Deskripsi Layar diaktifkan.")
+      elseif which == 1 then
+        setScanMode("video_desc")
+        service.speak("Mode Deskripsi Video diaktifkan.")
       else
         setScanMode("text_ocr")
         service.speak("Mode Pindai Teks Saja diaktifkan.")
+      end
+    end)
+    .setNegativeButton("Batal", nil)
+
+  displayOverlayDialog(builder)
+end
+
+local function showVideoDurationDialog()
+  local durationOptions = {
+    "10 Detik (Cepat & Ringkas)",
+    "15 Detik (Sedang & Optimal)",
+    "20 Detik (Lebih Lengkap)"
+  }
+
+  local curDur = getVideoDuration()
+  local selectedIndex = 0
+  if curDur == 10 then selectedIndex = 0
+  elseif curDur == 15 then selectedIndex = 1
+  elseif curDur == 20 then selectedIndex = 2
+  end
+
+  local builder = AlertDialog.Builder(service)
+    .setTitle("Pilih Durasi Perekaman Video")
+    .setSingleChoiceItems(durationOptions, selectedIndex, function(dialog, which)
+      dialog.dismiss()
+      if which == 0 then
+        setVideoDuration(10)
+        service.speak("Durasi video diatur ke 10 detik.")
+      elseif which == 1 then
+        setVideoDuration(15)
+        service.speak("Durasi video diatur ke 15 detik.")
+      elseif which == 2 then
+        setVideoDuration(20)
+        service.speak("Durasi video diatur ke 20 detik.")
       end
     end)
     .setNegativeButton("Batal", nil)
@@ -722,6 +812,29 @@ local function showImageInstructionDialog()
   displayOverlayDialog(builder)
 end
 
+local function showVideoInstructionDialog()
+  local input = EditText(service)
+  input.setText(getVideoInstruction())
+  input.setMinLines(5)
+
+  local builder = AlertDialog.Builder(service)
+    .setTitle("Instruksi Deskripsi Video")
+    .setView(input)
+    .setPositiveButton("Simpan", function()
+      local newInst = tostring(input.getText()):gsub("^%s*(.-)%s*$", "%1")
+      if newInst == "" then newInst = defaultVideoInstruction end
+      setVideoInstruction(newInst)
+      service.speak("Instruksi deskripsi video berhasil disimpan.")
+    end)
+    .setNeutralButton("Reset Default", function()
+      setVideoInstruction(defaultVideoInstruction)
+      service.speak("Instruksi deskripsi video dikembalikan ke default.")
+    end)
+    .setNegativeButton("Batal", nil)
+
+  displayOverlayDialog(builder)
+end
+
 local function showTextInstructionDialog()
   local input = EditText(service)
   input.setText(getTextInstruction())
@@ -754,7 +867,13 @@ showMainMenu = function()
     currentKeyStatus = "Bawaan Aktif"
   end
 
-  local currentModeText = (getScanMode() == "text_ocr") and "Pindai Teks Saja" or "Deskripsi Layar"
+  local modeLabels = {
+    ["visual_desc"] = "Deskripsi Layar",
+    ["video_desc"] = "Deskripsi Video",
+    ["text_ocr"] = "Pindai Teks Saja"
+  }
+  local currentModeText = modeLabels[getScanMode()] or "Deskripsi Layar"
+  local currentDurText = tostring(getVideoDuration()) .. " Detik"
 
   local resLabels = {
     ["original"] = "Asli Layar",
@@ -767,9 +886,11 @@ showMainMenu = function()
   local menuItems = {
     "1. Atur Kunci API Groq (" .. currentKeyStatus .. ")",
     "2. Mode Pemindaian (Aktif: " .. currentModeText .. ")",
-    "3. Kualitas Resolusi Screenshot (Aktif: " .. currentResText .. ")",
-    "4. Atur Instruksi Deskripsi Layar",
-    "5. Atur Instruksi Pindai Teks"
+    "3. Durasi Perekaman Video (Aktif: " .. currentDurText .. ")",
+    "4. Kualitas Resolusi Screenshot (Aktif: " .. currentResText .. ")",
+    "5. Atur Instruksi Deskripsi Layar",
+    "6. Atur Instruksi Deskripsi Video",
+    "7. Atur Instruksi Pindai Teks"
   }
 
   local builder = AlertDialog.Builder(service)
@@ -781,10 +902,14 @@ showMainMenu = function()
       elseif which == 1 then
         showScanModeDialog()
       elseif which == 2 then
-        showResolutionDialog()
+        showVideoDurationDialog()
       elseif which == 3 then
-        showImageInstructionDialog()
+        showResolutionDialog()
       elseif which == 4 then
+        showImageInstructionDialog()
+      elseif which == 5 then
+        showVideoInstructionDialog()
+      elseif which == 6 then
         showTextInstructionDialog()
       end
     end)
@@ -807,75 +932,179 @@ startScreenDescription = function()
     return
   end
 
-  local isTextMode = (getScanMode() == "text_ocr")
+  local scanMode = getScanMode()
+
+  -- ==================================================================
+  -- ALUR 1: MODE DESKRIPSI VIDEO (3 FRAME KRONOLOGIS VERTIKAL)
+  -- ==================================================================
+  if scanMode == "video_desc" then
+    local dur = getVideoDuration()
+    local interval = math.floor((dur * 1000) / 2)
+    service.speak("Merekam video selama " .. tostring(dur) .. " detik...")
+
+    local frames = {}
+
+    -- Ambil Frame 1: Awal Pemutaran (Panel Atas)
+    mainHandler.postDelayed(Runnable{
+      run = function()
+        captureSingleFrame(function(ok1, bmp1)
+          if not ok1 or not bmp1 then
+            local err = "Gagal mengambil frame awal video."
+            chatHistory = { {role = "assistant", content = err} }
+            service.speak(err)
+            showChatDialog()
+            return
+          end
+          table.insert(frames, bmp1)
+
+          -- Ambil Frame 2: Pertengahan Pemutaran (Panel Tengah)
+          mainHandler.postDelayed(Runnable{
+            run = function()
+              captureSingleFrame(function(ok2, bmp2)
+                if not ok2 or not bmp2 then
+                  local err = "Gagal mengambil frame tengah video."
+                  chatHistory = { {role = "assistant", content = err} }
+                  service.speak(err)
+                  showChatDialog()
+                  return
+                end
+                table.insert(frames, bmp2)
+
+                -- Ambil Frame 3: Akhir Pemutaran (Panel Bawah)
+                mainHandler.postDelayed(Runnable{
+                  run = function()
+                    captureSingleFrame(function(ok3, bmp3)
+                      if not ok3 or not bmp3 then
+                        local err = "Gagal mengambil frame akhir video."
+                        chatHistory = { {role = "assistant", content = err} }
+                        service.speak(err)
+                        showChatDialog()
+                        return
+                      end
+                      table.insert(frames, bmp3)
+
+                      service.speak("Menganalisis video dengan Groq...")
+
+                      Thread(Runnable{
+                        run = function()
+                          local base64Screen = nil
+                          pcall(function()
+                            local w = frames[1].getWidth()
+                            local h1 = frames[1].getHeight()
+                            local h2 = frames[2].getHeight()
+                            local h3 = frames[3].getHeight()
+                            local totalH = h1 + h2 + h3
+
+                            local stitched = Bitmap.createBitmap(w, totalH, Bitmap.Config.ARGB_8888)
+                            local canvas = Canvas(stitched)
+                            canvas.drawBitmap(frames[1], 0, 0, nil)
+                            canvas.drawBitmap(frames[2], 0, h1, nil)
+                            canvas.drawBitmap(frames[3], 0, h1 + h2, nil)
+
+                            pcall(function() frames[1].recycle() end)
+                            pcall(function() frames[2].recycle() end)
+                            pcall(function() frames[3].recycle() end)
+
+                            -- true: Mengaktifkan optimasi resolusi khusus mode video
+                            base64Screen = bitmapToBase64(stitched, true)
+                          end)
+
+                          mainHandler.post(Runnable{
+                            run = function()
+                              if base64Screen then
+                                chatHistory = {}
+                                currentSysInstruction = getVideoInstruction()
+                                local queryText = "Deskripsikan alur cerita kronologis dari kompilasi video 3 panel vertikal ini secara lengkap dan runtut."
+                                sendGroqChat(queryText, base64Screen, function(success, reply)
+                                  if success then
+                                    service.speak(reply)
+                                    showChatDialog()
+                                  else
+                                    local errMsg = "Gagal memproses video: " .. reply
+                                    table.insert(chatHistory, {role = "assistant", content = errMsg})
+                                    service.speak(errMsg)
+                                    showChatDialog()
+                                  end
+                                end)
+                              else
+                                local errBmp = "Gagal menggabungkan panel video."
+                                chatHistory = { {role = "assistant", content = errBmp} }
+                                service.speak(errBmp)
+                                showChatDialog()
+                              end
+                            end
+                          })
+                        end
+                      }).start()
+                    end)
+                  end
+                }, interval)
+              end)
+            end
+          }, interval)
+        end)
+      end
+    }, 250)
+    return
+  end
+
+  -- ==================================================================
+  -- ALUR 2: MODE DESKRIPSI LAYAR BIASA & PINDAI TEKS
+  -- ==================================================================
+  local isTextMode = (scanMode == "text_ocr")
   service.speak(isTextMode and "Memindai teks pada layar..." or "Memindai layar...")
 
   mainHandler.postDelayed(Runnable{
     run = function()
-      pcall(function()
-        service.takeScreenshot(Display.DEFAULT_DISPLAY, service.getMainExecutor(), TakeScreenshotCallback{
-          onSuccess = function(screenshotResult)
-            Thread(Runnable{
-              run = function()
-                local base64Screen = nil
-                pcall(function()
-                  local hwBuffer = screenshotResult.getHardwareBuffer()
-                  local colorSpace = screenshotResult.getColorSpace()
-                  local bitmap = Bitmap.wrapHardwareBuffer(hwBuffer, colorSpace)
-                  if bitmap then
-                    base64Screen = bitmapToBase64(bitmap)
-                  end
-                  if hwBuffer then hwBuffer.close() end
-                end)
+      captureSingleFrame(function(ok, bitmap)
+        if not ok or not bitmap then
+          local errShot = bitmap or "Gagal mengambil tangkapan layar."
+          chatHistory = { {role = "assistant", content = errShot} }
+          service.speak(errShot)
+          showChatDialog()
+          return
+        end
 
-                mainHandler.post(Runnable{
-                  run = function()
-                    if base64Screen then
-                      service.speak(isTextMode and "Mengekstrak teks..." or "Menganalisis dengan Groq...")
-                      chatHistory = {}
-
-                      local queryText = ""
-                      if isTextMode then
-                        currentSysInstruction = getTextInstruction()
-                        queryText = "Tuliskan seluruh teks asli yang terlihat di layar ini persis apa adanya tanpa kata pengantar atau deskripsi visual apa pun."
-                      else
-                        currentSysInstruction = getImageInstruction()
-                        queryText = "Deskripsikan konten utama pada layar ini secara terperinci tanpa menyebutkan bilah status atas maupun bilah navigasi bawah."
-                      end
-
-                      sendGroqChat(queryText, base64Screen, function(success, reply)
-                        if success then
-                          service.speak(reply)
-                          showChatDialog()
-                        else
-                          local errMsg = "Gagal memproses layar: " .. reply
-                          table.insert(chatHistory, {role = "assistant", content = errMsg})
-                          service.speak(errMsg)
-                          showChatDialog()
-                        end
-                      end)
-                    else
-                      local errBmp = "Gagal memproses bitmap layar."
-                      chatHistory = { {role = "assistant", content = errBmp} }
-                      service.speak(errBmp)
-                      showChatDialog()
-                    end
-                  end
-                })
-              end
-            }).start()
-          end,
-          onFailure = function(errorCode)
+        Thread(Runnable{
+          run = function()
+            -- false: Menggunakan resolusi penuh sesuai setelan pengguna
+            local base64Screen = bitmapToBase64(bitmap, false)
             mainHandler.post(Runnable{
               run = function()
-                local errShot = "Gagal mengambil tangkapan layar. Kode: " .. tostring(errorCode)
-                chatHistory = { {role = "assistant", content = errShot} }
-                service.speak(errShot)
-                showChatDialog()
+                if base64Screen then
+                  service.speak(isTextMode and "Mengekstrak teks..." or "Menganalisis dengan Groq...")
+                  chatHistory = {}
+
+                  local queryText = ""
+                  if isTextMode then
+                    currentSysInstruction = getTextInstruction()
+                    queryText = "Tuliskan seluruh teks asli yang terlihat di layar ini persis apa adanya tanpa kata pengantar atau deskripsi visual apa pun."
+                  else
+                    currentSysInstruction = getImageInstruction()
+                    queryText = "Deskripsikan konten utama pada layar ini secara terperinci tanpa menyebutkan bilah status atas maupun bilah navigasi bawah."
+                  end
+
+                  sendGroqChat(queryText, base64Screen, function(success, reply)
+                    if success then
+                      service.speak(reply)
+                      showChatDialog()
+                    else
+                      local errMsg = "Gagal memproses layar: " .. reply
+                      table.insert(chatHistory, {role = "assistant", content = errMsg})
+                      service.speak(errMsg)
+                      showChatDialog()
+                    end
+                  end)
+                else
+                  local errBmp = "Gagal memproses bitmap layar."
+                  chatHistory = { {role = "assistant", content = errBmp} }
+                  service.speak(errBmp)
+                  showChatDialog()
+                end
               end
             })
           end
-        })
+        }).start()
       end)
     end
   }, 250)
