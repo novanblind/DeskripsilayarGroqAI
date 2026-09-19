@@ -40,8 +40,9 @@ local CURRENT_VERSION = "2.0.0"
 -- URL RAW GitHub repositori Anda
 local GITHUB_RAW_URL = "https://raw.githubusercontent.com/novanblind/DeskripsilayarGroqAI/main/groq_vision.lua"
 
--- Kunci API Bawaan
-local defaultApiKey = "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"
+-- Kunci default dikosongkan agar aman di GitHub publik
+-- Kunci akan dibaca otomatis dari file lokal api_key.txt
+local defaultApiKey = ""
 
 -- Default system instruction untuk deskripsi layar tunggal
 local defaultImageInstruction = [[Deskripsikan gambar atau tampilan layar secara jelas, natural, dan profesional dalam bahasa Indonesia. Susun narasi visual yang mengalir dari elemen paling dominan ke objek, karakter, lingkungan, dan detail sekitarnya. Jelaskan warna, bentuk, ukuran, tekstur, posisi, pencahayaan, suasana, komposisi, serta hubungan antarelemen tanpa berlebihan atau mengarang informasi. Abaikan elemen antarmuka ponsel yang tidak relevan, seperti indikator sinyal, baterai, waktu, notifikasi, atau ikon sistem lainnya, kecuali jika secara khusus diminta untuk menjelaskannya.
@@ -60,13 +61,94 @@ local availableModels = {
 -- SharedPreferences Groq khusus Deskripsi Visual
 local sp = service.getSharedPreferences("groq_vision_desc_config", Context.MODE_PRIVATE)
 
-local function getApiKey()
-  local key = sp.getString("api_key", defaultApiKey)
-  if key == nil or key == "" then return defaultApiKey end
-  return key
+-- ====================================================================
+-- SISTEM MANAJEMEN FILE LOKAL & API KEY TERPISAH
+-- ====================================================================
+local function getScriptFilePath()
+  local src = debug.getinfo(1, "S").source
+  if src and src:sub(1, 1) == "@" then
+    return src:sub(2)
+  end
+  local fallbackPaths = {
+    "/sdcard/jieshuo/plugin/Deskripsi Layar Groq/main.lua",
+    "/sdcard/jieshuo/plugin/DeskripsilayarGroqAI/groq_vision.lua",
+    "/sdcard/jieshuo/plugin/DeskripsiLayarGroq/main.lua"
+  }
+  for _, path in ipairs(fallbackPaths) do
+    if File(path).exists() then return path end
+  end
+  return nil
 end
 
-local function setApiKey(k) sp.edit().putString("api_key", k).apply() end
+local function getScriptDir()
+  local path = getScriptFilePath()
+  if path then
+    return path:match("(.*/)")
+  end
+  return "/sdcard/jieshuo/plugin/Deskripsi Layar Groq/"
+end
+
+-- Fungsi otomatis untuk membaca API Key dari api_key.txt di HP
+local function readLocalApiKeyFile()
+  local dir = getScriptDir()
+  local candidates = {
+    dir and (dir .. "api_key.txt"),
+    "/sdcard/jieshuo/plugin/Deskripsi Layar Groq/api_key.txt",
+    "/sdcard/jieshuo/plugin/DeskripsilayarGroqAI/api_key.txt",
+    "/sdcard/jieshuo/plugin/DeskripsiLayarGroq/api_key.txt",
+    "/sdcard/jieshuo/groq_api_key.txt"
+  }
+  for _, filePath in ipairs(candidates) do
+    if filePath and File(filePath).exists() then
+      local f = io.open(filePath, "r")
+      if f then
+        local content = f:read("*all")
+        f:close()
+        if content then
+          local key = content:gsub("^%s*(.-)%s*$", "%1")
+          if key ~= "" then return key end
+        end
+      end
+    end
+  end
+  return ""
+end
+
+-- Fungsi menyimpan kunci API ke api_key.txt saat diubah melalui dialog
+local function saveLocalApiKeyFile(key)
+  local dir = getScriptDir()
+  local target = dir .. "api_key.txt"
+  pcall(function()
+    local f = File(target)
+    if not f.getParentFile().exists() then
+      f.getParentFile().mkdirs()
+    end
+    local fos = FileOutputStream(f)
+    fos.write(String(key):getBytes("UTF-8"))
+    fos.flush()
+    fos.close()
+  end)
+end
+
+local function getApiKey()
+  -- 1. Cek SharedPreferences
+  local key = sp.getString("api_key", "")
+  if key ~= nil and key ~= "" then return key end
+
+  -- 2. Cek file lokal api_key.txt
+  local fileKey = readLocalApiKeyFile()
+  if fileKey ~= "" then return fileKey end
+
+  -- 3. Fallback ke default
+  return defaultApiKey
+end
+
+local function setApiKey(k)
+  sp.edit().putString("api_key", k).apply()
+  if k ~= "" then
+    saveLocalApiKeyFile(k)
+  end
+end
 
 local function getModelName() return sp.getString("model_name", "qwen/qwen3.8-27b") end
 local function setModelName(m) sp.edit().putString("model_name", m).apply() end
@@ -100,22 +182,6 @@ local checkAppUpdate
 -- ====================================================================
 -- MODUL SISTEM AUTO-UPDATE
 -- ====================================================================
-local function getScriptFilePath()
-  local src = debug.getinfo(1, "S").source
-  if src and src:sub(1, 1) == "@" then
-    return src:sub(2)
-  end
-  -- Fallback jika path tidak terbaca langsung dari debug
-  local fallbackPaths = {
-    "/sdcard/jieshuo/plugin/Deskripsi Layar Groq/main.lua",
-    "/sdcard/jieshuo/plugin/DeskripsilayarGroqAI/groq_vision.lua"
-  }
-  for _, path in ipairs(fallbackPaths) do
-    if File(path).exists() then return path end
-  end
-  return nil
-end
-
 local function parseVersion(verStr)
   local parts = {}
   for num in string.gmatch(verStr or "", "(%d+)") do
@@ -156,7 +222,7 @@ end
 checkAppUpdate = function(isManual)
   if GITHUB_RAW_URL:find("USERNAME/REPO_NAME") then
     if isManual then
-      service.speak("URL GitHub belum dikonfigurasi. Silakan ubah variabel GITHUB_RAW_URL pada script.")
+      service.speak("URL GitHub belum dikonfigurasi. Silakan periksa variabel GITHUB_RAW_URL.")
     end
     return
   end
@@ -174,7 +240,6 @@ checkAppUpdate = function(isManual)
       local errDetail = ""
 
       pcall(function()
-        -- Tambahkan parameter waktu (?t=...) agar selalu mengambil revisi terbaru (anti-cache CDN)
         local fetchUrl = GITHUB_RAW_URL .. "?t=" .. tostring(os.time())
         local url = URL(fetchUrl)
         conn = url.openConnection()
@@ -227,7 +292,7 @@ checkAppUpdate = function(isManual)
                   service.speak("Pembaruan berhasil dipasang. Silakan jalankan ulang plugin.")
                   local successDialog = AlertDialog.Builder(service)
                     .setTitle("Sukses")
-                    .setMessage("Script berhasil diperbarui ke versi " .. remoteVersion .. "!\nSilakan jalankan ulang script atau buka kembali menu untuk memuat fitur terbaru.")
+                    .setMessage("Script berhasil diperbarui ke versi " .. remoteVersion .. "!\nKunci API lokal Anda tetap aman dan tidak terhapus.\nSilakan jalankan ulang plugin.")
                     .setPositiveButton("OK", nil)
                   displayOverlayDialog(successDialog)
                 else
@@ -277,7 +342,7 @@ end
 local function sendGroqChat(userText, mediaData, onComplete)
   local apiKey = getApiKey()
   if apiKey == "" then
-    onComplete(false, "Kunci API Groq belum diatur. Silakan masukkan kunci API terlebih dahulu.")
+    onComplete(false, "Kunci API Groq belum ditemukan. Pastikan file api_key.txt sudah terisi atau masukkan via menu setelan.")
     showApiKeyDialog()
     return
   end
@@ -558,12 +623,8 @@ showApiKeyDialog = function()
     .setPositiveButton("Simpan", function()
       local key = tostring(input.getText()):gsub("^%s*(.-)%s*$", "%1")
       setApiKey(key)
-      if key ~= "" then service.speak("Kunci API Groq berhasil disimpan.")
-      else service.speak("Kunci API dikosongkan, kembali ke bawaan.") end
-    end)
-    .setNeutralButton("Reset Bawaan", function()
-      setApiKey(defaultApiKey)
-      service.speak("Kunci API dikembalikan ke setelan bawaan.")
+      if key ~= "" then service.speak("Kunci API Groq berhasil disimpan ke penyimpanan lokal.")
+      else service.speak("Kunci API dikosongkan.") end
     end)
     .setNegativeButton("Batal", nil)
 
@@ -572,7 +633,7 @@ end
 
 startScreenDescription = function()
   if getApiKey() == "" then
-    service.speak("Kunci API Groq belum diatur. Silakan masukkan kunci API terlebih dahulu.")
+    service.speak("Kunci API Groq belum ditemukan. Silakan atur kunci API atau buat file api_key.txt.")
     showApiKeyDialog()
     return
   end
@@ -741,7 +802,7 @@ end
 
 -- Menu Utama
 showMainMenu = function()
-  local currentKeyStatus = (getApiKey() ~= "") and "Terpasang" or "Belum Diatur"
+  local currentKeyStatus = (getApiKey() ~= "") and "Terpasang (Aman)" or "Belum Diatur"
   
   local menuItems = {
     "1. Deskripsikan Layar",
