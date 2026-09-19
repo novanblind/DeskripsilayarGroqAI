@@ -41,7 +41,7 @@ local CURRENT_VERSION = "2.0.0"
 local GITHUB_RAW_URL = "https://raw.githubusercontent.com/novanblind/DeskripsilayarGroqAI/main/groq_vision.lua"
 
 -- Kunci default dikosongkan agar aman di GitHub publik
--- Kunci akan dibaca otomatis dari file lokal api_key.txt
+-- Kunci dibaca otomatis dari file lokal api_key.txt
 local defaultApiKey = ""
 
 -- Default system instruction untuk deskripsi layar tunggal
@@ -60,6 +60,10 @@ local availableModels = {
 
 -- SharedPreferences Groq khusus Deskripsi Visual
 local sp = service.getSharedPreferences("groq_vision_desc_config", Context.MODE_PRIVATE)
+
+-- Variabel kontrol agar pembaruan latar belakang tidak mengganggu pemindaian
+local isScanningScreen = false
+local pendingUpdateAction = nil
 
 -- ====================================================================
 -- SISTEM MANAJEMEN FILE LOKAL & API KEY TERPISAH
@@ -88,7 +92,7 @@ local function getScriptDir()
   return "/sdcard/jieshuo/plugin/Deskripsi Layar Groq/"
 end
 
--- Fungsi otomatis untuk membaca API Key dari api_key.txt di HP
+-- Fungsi membaca API Key dari api_key.txt di HP
 local function readLocalApiKeyFile()
   local dir = getScriptDir()
   local candidates = {
@@ -178,6 +182,20 @@ local showApiKeyDialog
 local startScreenDescription
 local showChatDialog
 local checkAppUpdate
+
+-- Menjalankan prompt pembaruan tertunda setelah pemindaian selesai
+local function triggerPendingUpdateIfAny()
+  if pendingUpdateAction then
+    mainHandler.postDelayed(Runnable{
+      run = function()
+        if pendingUpdateAction then
+          pendingUpdateAction()
+          pendingUpdateAction = nil
+        end
+      end
+    }, 1500)
+  end
+end
 
 -- ====================================================================
 -- MODUL SISTEM AUTO-UPDATE
@@ -281,26 +299,34 @@ checkAppUpdate = function(isManual)
             or remoteContent:match('@version%s+([%d%.]+)')
 
           if remoteVersion and isNewerVersion(remoteVersion, CURRENT_VERSION) then
-            service.speak("Pembaruan versi " .. remoteVersion .. " tersedia.")
-            
-            local builder = AlertDialog.Builder(service)
-              .setTitle("Pembaruan Tersedia")
-              .setMessage("Versi baru (" .. remoteVersion .. ") telah dirilis di GitHub.\nVersi saat ini: " .. CURRENT_VERSION .. "\n\nPerbarui script sekarang?")
-              .setPositiveButton("Perbarui", function()
-                local localPath = getScriptFilePath()
-                if localPath and saveNewScript(remoteContent, localPath) then
-                  service.speak("Pembaruan berhasil dipasang. Silakan jalankan ulang plugin.")
-                  local successDialog = AlertDialog.Builder(service)
-                    .setTitle("Sukses")
-                    .setMessage("Script berhasil diperbarui ke versi " .. remoteVersion .. "!\nKunci API lokal Anda tetap aman dan tidak terhapus.\nSilakan jalankan ulang plugin.")
-                    .setPositiveButton("OK", nil)
-                  displayOverlayDialog(successDialog)
-                else
-                  service.speak("Gagal menyimpan file script baru ke penyimpanan lokal.")
-                end
-              end)
-              .setNegativeButton("Nanti", nil)
-            displayOverlayDialog(builder)
+            local function promptUpdateDialog()
+              service.speak("Pembaruan versi " .. remoteVersion .. " tersedia.")
+              local builder = AlertDialog.Builder(service)
+                .setTitle("Pembaruan Tersedia")
+                .setMessage("Versi baru (" .. remoteVersion .. ") telah dirilis di GitHub.\nVersi saat ini: " .. CURRENT_VERSION .. "\n\nPerbarui script sekarang?")
+                .setPositiveButton("Perbarui", function()
+                  local localPath = getScriptFilePath()
+                  if localPath and saveNewScript(remoteContent, localPath) then
+                    service.speak("Pembaruan berhasil dipasang. Silakan jalankan ulang plugin.")
+                    local successDialog = AlertDialog.Builder(service)
+                      .setTitle("Sukses")
+                      .setMessage("Script berhasil diperbarui ke versi " .. remoteVersion .. "!\nKunci API lokal Anda tetap aman dan tidak terhapus.\nSilakan jalankan ulang plugin.")
+                      .setPositiveButton("OK", nil)
+                    displayOverlayDialog(successDialog)
+                  else
+                    service.speak("Gagal menyimpan file script baru ke penyimpanan lokal.")
+                  end
+                end)
+                .setNegativeButton("Nanti", nil)
+              displayOverlayDialog(builder)
+            end
+
+            -- Jika sedang memindai layar dan bukan pengecekan manual, tunda dialognya
+            if isScanningScreen and not isManual then
+              pendingUpdateAction = promptUpdateDialog
+            else
+              promptUpdateDialog()
+            end
           else
             if isManual then
               service.speak("Script sudah menggunakan versi terbaru (v" .. CURRENT_VERSION .. ").")
@@ -633,18 +659,22 @@ end
 
 startScreenDescription = function()
   if getApiKey() == "" then
+    isScanningScreen = false
     service.speak("Kunci API Groq belum ditemukan. Silakan atur kunci API atau buat file api_key.txt.")
     showApiKeyDialog()
     return
   end
   if Build.VERSION.SDK_INT < 30 then
+    isScanningScreen = false
     local errText = "Fitur tangkapan layar membutuhkan minimal Android 11."
     chatHistory = { {role = "assistant", content = errText} }
     service.speak(errText)
     showChatDialog()
+    triggerPendingUpdateIfAny()
     return
   end
 
+  isScanningScreen = true
   service.speak("Memindai layar...")
   mainHandler.postDelayed(Runnable{
     run = function()
@@ -664,6 +694,7 @@ startScreenDescription = function()
                 
                 service.speak("Menganalisis dengan Groq...")
                 sendGroqChat("Deskripsikan konten utama pada layar ini secara terperinci tanpa menyebutkan bilah status atas maupun bilah navigasi bawah.", base64Screen, function(success, reply)
+                  isScanningScreen = false
                   if success then
                     service.speak(reply)
                     showChatDialog()
@@ -673,21 +704,27 @@ startScreenDescription = function()
                     service.speak(errMsg)
                     showChatDialog()
                   end
+                  -- Jalankan pengecekan pembaruan tertunda jika ada update dari GitHub
+                  triggerPendingUpdateIfAny()
                 end)
               else
+                isScanningScreen = false
                 pcall(function() hwBuffer.close() end)
                 local errBmp = "Gagal memproses bitmap layar."
                 chatHistory = { {role = "assistant", content = errBmp} }
                 service.speak(errBmp)
                 showChatDialog()
+                triggerPendingUpdateIfAny()
               end
             end)
           end,
           onFailure = function(errorCode)
+            isScanningScreen = false
             local errShot = "Gagal mengambil tangkapan layar. Kode: " .. tostring(errorCode)
             chatHistory = { {role = "assistant", content = errShot} }
             service.speak(errShot)
             showChatDialog()
+            triggerPendingUpdateIfAny()
           end
         })
       end)
@@ -830,13 +867,22 @@ showMainMenu = function()
   displayOverlayDialog(builder)
 end
 
--- Eksekusi awal
+-- ====================================================================
+-- EKSEKUSI AWAL
+-- ====================================================================
 local startMode = getAppMode()
 if startMode == "direct_image" or startMode == "direct" then
+  -- Jalankan deskripsi langsung
   startScreenDescription()
+  -- Tetap periksa pembaruan di latar belakang tanpa mengganggu
+  mainHandler.postDelayed(Runnable{
+    run = function()
+      checkAppUpdate(false)
+    end
+  }, 1000)
 else
+  -- Mode normal: buka menu utama
   showMainMenu()
-  -- Cek pembaruan otomatis di latar belakang saat membuka menu
   mainHandler.postDelayed(Runnable{
     run = function()
       checkAppUpdate(false)
