@@ -35,7 +35,7 @@ local mainHandler = Handler(Looper.getMainLooper())
 -- ====================================================================
 -- KONFIGURASI VERSI & GITHUB AUTO-UPDATE
 -- ====================================================================
-local CURRENT_VERSION = "2.0.1"
+local CURRENT_VERSION = "2.0.2"
 
 -- URL RAW GitHub repositori Anda
 local GITHUB_RAW_URL = "https://raw.githubusercontent.com/novanblind/DeskripsilayarGroqAI/main/groq_vision.lua"
@@ -113,40 +113,31 @@ local function readLocalApiKeyFile()
   return ""
 end
 
--- Fungsi menyimpan kunci API ke api_key.txt jika file belum ada
-local function saveLocalApiKeyFile(key)
-  local dir = getScriptDir()
-  local target = dir .. "api_key.txt"
-  pcall(function()
-    local f = File(target)
-    if not f.getParentFile().exists() then
-      f.getParentFile().mkdirs()
-    end
-    local fos = FileOutputStream(f)
-    fos.write(String(key):getBytes("UTF-8"))
-    fos.flush()
-    fos.close()
-  end)
+-- Mengambil kunci kustom pengguna (jika pernah diinput via dialog)
+local function getCustomApiKey()
+  local k = sp.getString("api_key", "")
+  if k ~= nil and k ~= "" then return k end
+  return ""
 end
 
 local function getApiKey()
-  -- 1. Cek SharedPreferences (jika pengguna menyetel kunci kustom)
-  local key = sp.getString("api_key", "")
-  if key ~= nil and key ~= "" then return key end
+  -- 1. Prioritas utama: Kunci kustom pengguna dari SharedPreferences
+  local customKey = getCustomApiKey()
+  if customKey ~= "" then return customKey end
 
-  -- 2. Cek file lokal api_key.txt (kunci bawaan)
+  -- 2. Prioritas kedua: Kunci bawaan dari file lokal api_key.txt
   local fileKey = readLocalApiKeyFile()
   if fileKey ~= "" then return fileKey end
 
-  -- 3. Fallback ke default
+  -- 3. Terakhir: defaultApiKey
   return defaultApiKey
 end
 
 local function setApiKey(k)
-  sp.edit().putString("api_key", k).apply()
-  -- Jika file api_key.txt belum ada, simpan juga sebagai cadangan
-  if readLocalApiKeyFile() == "" and k ~= "" then
-    saveLocalApiKeyFile(k)
+  if k and k ~= "" then
+    sp.edit().putString("api_key", k).apply()
+  else
+    sp.edit().remove("api_key").apply()
   end
 end
 
@@ -334,16 +325,34 @@ checkAppUpdate = function(isManual)
 end
 
 -- ====================================================================
--- MODUL PENGOLAHAN GAMBAR & GROQ API
+-- MODUL PENGOLAHAN GAMBAR & GROQ API (RINGAN & BEBAS MACET)
 -- ====================================================================
 local function bitmapToBase64(bitmap, quality)
-  local targetQuality = quality or 90
-  local targetBitmap = bitmap
-  local needRecycleTarget = false
+  local targetQuality = quality or 85
+  local w = bitmap.getWidth()
+  local h = bitmap.getHeight()
   
-  if bitmap.getConfig() == Bitmap.Config.HARDWARE then
-    targetBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, false)
-    needRecycleTarget = true
+  -- Optimasi resolusi: Batasi lebar maks 1080px agar teks tetap tajam namun pemrosesan cepat
+  local maxWidth = 1080
+  local scale = 1.0
+  if w > maxWidth then
+    scale = maxWidth / w
+  end
+
+  local targetBitmap = bitmap
+  local needRecycle = false
+
+  if bitmap.getConfig() == Bitmap.Config.HARDWARE or scale < 1.0 then
+    local copyBmp = bitmap.copy(Bitmap.Config.ARGB_8888, false)
+    if scale < 1.0 then
+      local newW = math.floor(w * scale)
+      local newH = math.floor(h * scale)
+      targetBitmap = Bitmap.createScaledBitmap(copyBmp, newW, newH, true)
+      pcall(function() copyBmp.recycle() end)
+    else
+      targetBitmap = copyBmp
+    end
+    needRecycle = true
   end
 
   local baos = ByteArrayOutputStream()
@@ -351,12 +360,12 @@ local function bitmapToBase64(bitmap, quality)
   local bytes = baos.toByteArray()
   baos.close()
   local base64Str = Base64.encodeToString(bytes, Base64.NO_WRAP)
-  
-  if needRecycleTarget and targetBitmap ~= bitmap then 
-    pcall(function() targetBitmap.recycle() end) 
+
+  if needRecycle and targetBitmap ~= bitmap then
+    pcall(function() targetBitmap.recycle() end)
   end
   pcall(function() bitmap.recycle() end)
-  
+
   return base64Str
 end
 
@@ -632,11 +641,23 @@ showChatDialog = function()
   end)
 end
 
--- Dialog Pengaturan Kunci API (Lengkap dengan Tombol Reset Bawaan)
+-- Dialog Pengaturan Kunci API (Kunci bawaan tidak ditampilkan di kolom input)
 showApiKeyDialog = function()
+  local customKey = getCustomApiKey()
   local input = EditText(service)
-  input.setText(getApiKey())
-  input.setHint("Tempel Kunci API Groq (gsk_...) di sini...")
+
+  if customKey ~= "" then
+    input.setText(customKey)
+  else
+    input.setText("")
+  end
+
+  local defaultExists = (readLocalApiKeyFile() ~= "" or defaultApiKey ~= "")
+  if defaultExists and customKey == "" then
+    input.setHint("Kunci bawaan aktif. Tempel kunci baru jika ingin mengganti...")
+  else
+    input.setHint("Tempel Kunci API Groq (gsk_...) di sini...")
+  end
   input.setSingleLine(true)
 
   local builder = AlertDialog.Builder(service)
@@ -644,18 +665,18 @@ showApiKeyDialog = function()
     .setView(input)
     .setPositiveButton("Simpan", function()
       local key = tostring(input.getText()):gsub("^%s*(.-)%s*$", "%1")
-      setApiKey(key)
-      if key ~= "" then 
-        service.speak("Kunci API Groq berhasil disimpan.")
-      else 
-        service.speak("Kunci API dikosongkan.") 
+      if key ~= "" then
+        setApiKey(key)
+        service.speak("Kunci API kustom berhasil disimpan.")
+      else
+        setApiKey("")
+        service.speak("Kunci kustom dihapus, kembali ke kunci bawaan.")
       end
     end)
     .setNeutralButton("Reset Bawaan", function()
-      -- Hapus kunci kustom dari SharedPreferences
-      sp.edit().remove("api_key").apply()
+      setApiKey("")
       local defaultKey = readLocalApiKeyFile()
-      if defaultKey ~= "" then
+      if defaultKey ~= "" or defaultApiKey ~= "" then
         service.speak("Kunci API dikembalikan ke setelan bawaan.")
       else
         service.speak("Kunci API di-reset. Pastikan file api_key.txt terisi kunci bawaan.")
@@ -666,6 +687,7 @@ showApiKeyDialog = function()
   displayOverlayDialog(builder)
 end
 
+-- Memulai Pemindaian Layar Secara Asinkron (Jalur Belakang)
 startScreenDescription = function()
   if getApiKey() == "" then
     isScanningScreen = false
@@ -690,49 +712,72 @@ startScreenDescription = function()
       pcall(function()
         service.takeScreenshot(Display.DEFAULT_DISPLAY, service.getMainExecutor(), TakeScreenshotCallback{
           onSuccess = function(screenshotResult)
-            pcall(function()
-              local hwBuffer = screenshotResult.getHardwareBuffer()
-              local colorSpace = screenshotResult.getColorSpace()
-              local bitmap = Bitmap.wrapHardwareBuffer(hwBuffer, colorSpace)
-              if bitmap then
-                local base64Screen = bitmapToBase64(bitmap, 90)
-                pcall(function() hwBuffer.close() end)
-                
-                chatHistory = {}
-                currentSysInstruction = getImageInstruction()
-                
-                service.speak("Menganalisis dengan Groq...")
-                sendGroqChat("Deskripsikan konten utama pada layar ini secara terperinci tanpa menyebutkan bilah status atas maupun bilah navigasi bawah.", base64Screen, function(success, reply)
-                  isScanningScreen = false
-                  if success then
-                    service.speak(reply)
-                    showChatDialog()
+            -- PINDAHKAN SELURUH PENGOLAHAN GAMBAR KE BACKGROUND THREAD
+            -- Agar UI Thread Jieshuo tidak macet dan kursor tetap bebas digerakkan
+            Thread(Runnable{
+              run = function()
+                local base64Screen = nil
+                pcall(function()
+                  local hwBuffer = screenshotResult.getHardwareBuffer()
+                  local colorSpace = screenshotResult.getColorSpace()
+                  local bitmap = Bitmap.wrapHardwareBuffer(hwBuffer, colorSpace)
+                  if bitmap then
+                    base64Screen = bitmapToBase64(bitmap, 85)
+                    pcall(function() hwBuffer.close() end)
                   else
-                    local errMsg = "Gagal memproses layar: " .. reply
-                    table.insert(chatHistory, {role = "assistant", content = errMsg})
-                    service.speak(errMsg)
-                    showChatDialog()
+                    pcall(function() hwBuffer.close() end)
                   end
-                  triggerPendingUpdateIfAny()
                 end)
-              else
-                isScanningScreen = false
-                pcall(function() hwBuffer.close() end)
-                local errBmp = "Gagal memproses bitmap layar."
-                chatHistory = { {role = "assistant", content = errBmp} }
-                service.speak(errBmp)
-                showChatDialog()
-                triggerPendingUpdateIfAny()
+
+                if base64Screen then
+                  mainHandler.post(Runnable{
+                    run = function()
+                      service.speak("Menganalisis dengan Groq...")
+                    end
+                  })
+                  
+                  chatHistory = {}
+                  currentSysInstruction = getImageInstruction()
+                  
+                  sendGroqChat("Deskripsikan konten utama pada layar ini secara terperinci tanpa menyebutkan bilah status atas maupun bilah navigasi bawah.", base64Screen, function(success, reply)
+                    isScanningScreen = false
+                    if success then
+                      service.speak(reply)
+                      showChatDialog()
+                    else
+                      local errMsg = "Gagal memproses layar: " .. reply
+                      table.insert(chatHistory, {role = "assistant", content = errMsg})
+                      service.speak(errMsg)
+                      showChatDialog()
+                    end
+                    triggerPendingUpdateIfAny()
+                  end)
+                else
+                  isScanningScreen = false
+                  mainHandler.post(Runnable{
+                    run = function()
+                      local errBmp = "Gagal memproses bitmap layar."
+                      chatHistory = { {role = "assistant", content = errBmp} }
+                      service.speak(errBmp)
+                      showChatDialog()
+                      triggerPendingUpdateIfAny()
+                    end
+                  })
+                end
               end
-            end)
+            }).start()
           end,
           onFailure = function(errorCode)
             isScanningScreen = false
-            local errShot = "Gagal mengambil tangkapan layar. Kode: " .. tostring(errorCode)
-            chatHistory = { {role = "assistant", content = errShot} }
-            service.speak(errShot)
-            showChatDialog()
-            triggerPendingUpdateIfAny()
+            mainHandler.post(Runnable{
+              run = function()
+                local errShot = "Gagal mengambil tangkapan layar. Kode: " .. tostring(errorCode)
+                chatHistory = { {role = "assistant", content = errShot} }
+                service.speak(errShot)
+                showChatDialog()
+                triggerPendingUpdateIfAny()
+              end
+            })
           end
         })
       end)
@@ -792,9 +837,15 @@ local function showModeSelectionDialog()
   displayOverlayDialog(builder)
 end
 
--- Menu Utama
+-- Menu Utama / Pengaturan
 showMainMenu = function()
-  local currentKeyStatus = (getApiKey() ~= "") and "Terpasang (Aman)" or "Belum Diatur"
+  local customKey = getCustomApiKey()
+  local currentKeyStatus = "Belum Diatur"
+  if customKey ~= "" then
+    currentKeyStatus = "Kustom Terpasang"
+  elseif getApiKey() ~= "" then
+    currentKeyStatus = "Bawaan Aktif"
+  end
   
   local menuItems = {
     "1. Deskripsikan Layar",
@@ -808,11 +859,16 @@ showMainMenu = function()
     .setTitle("Deskripsi Layar Groq AI (v" .. CURRENT_VERSION .. ")")
     .setItems(menuItems, function(dialog, which)
       dialog.dismiss()
-      if which == 0 then startScreenDescription()
-      elseif which == 1 then showApiKeyDialog()
-      elseif which == 2 then showModeSelectionDialog()
-      elseif which == 3 then showImageInstructionDialog()
-      elseif which == 4 then checkAppUpdate(true)
+      if which == 0 then 
+        startScreenDescription()
+      elseif which == 1 then 
+        showApiKeyDialog()
+      elseif which == 2 then 
+        showModeSelectionDialog()
+      elseif which == 3 then 
+        showImageInstructionDialog()
+      elseif which == 4 then 
+        checkAppUpdate(true)
       end
     end)
     .setNegativeButton("Tutup", nil)
@@ -839,3 +895,5 @@ else
     end
   }, 1000)
 end
+
+return true
