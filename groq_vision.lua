@@ -39,7 +39,7 @@ local mainHandler = Handler(Looper.getMainLooper())
 -- ====================================================================
 -- KONFIGURASI VERSI & GITHUB AUTO-UPDATE
 -- ====================================================================
-local CURRENT_VERSION = "2.1.4"
+local CURRENT_VERSION = "2.0.3"
 local GITHUB_RAW_URL = "https://raw.githubusercontent.com/novanblind/DeskripsilayarGroqAI/main/groq_vision.lua"
 
 local defaultApiKey = ""
@@ -184,7 +184,7 @@ local showChatDialog
 local checkAppUpdate
 
 -- ====================================================================
--- AUTO-UPDATE SENYAP DI LATAR BELAKANG
+-- SISTEM PEMBARUAN & DIALOG AUTO-UPDATE
 -- ====================================================================
 local function parseVersion(verStr)
   local parts = {}
@@ -223,17 +223,67 @@ local function saveNewScript(newCode, targetPath)
   return success
 end
 
+local function showDownloadCompleteDialog(newVersion)
+  mainHandler.post(Runnable{
+    run = function()
+      local message = "Pembaruan versi " .. tostring(newVersion) .. " berhasil diunduh dan dipasang."
+      local builder = AlertDialog.Builder(service)
+        .setTitle("Download Selesai")
+        .setMessage(message)
+        .setPositiveButton("Oke", function(dialog)
+          dialog.dismiss()
+        end)
+      displayOverlayDialog(builder)
+      pcall(function() service.speak("Download selesai.") end)
+    end
+  })
+end
+
+local function showUpdateAvailableDialog(remoteVersion, newScriptCode)
+  mainHandler.post(Runnable{
+    run = function()
+      local message = "Versi baru tersedia: " .. tostring(remoteVersion) .. "\nVersi yang Anda gunakan: " .. tostring(CURRENT_VERSION)
+      local builder = AlertDialog.Builder(service)
+        .setTitle("Versi Baru Tersedia")
+        .setMessage(message)
+        .setPositiveButton("Perbarui", function(dialog)
+          dialog.dismiss()
+          service.speak("Sedang memperbarui...")
+          Thread(Runnable{
+            run = function()
+              local localPath = getScriptFilePath()
+              if localPath and saveNewScript(newScriptCode, localPath) then
+                showDownloadCompleteDialog(remoteVersion)
+              else
+                mainHandler.post(Runnable{
+                  run = function()
+                    service.speak("Gagal menyimpan pembaruan.")
+                  end
+                })
+              end
+            end
+          }).start()
+        end)
+        .setNegativeButton("Nanti", function(dialog)
+          dialog.dismiss()
+        end)
+      displayOverlayDialog(builder)
+      pcall(function() service.speak("Versi baru tersedia. Versi baru: " .. tostring(remoteVersion) .. ". Versi yang Anda gunakan: " .. tostring(CURRENT_VERSION)) end)
+    end
+  })
+end
+
 checkAppUpdate = function()
   if GITHUB_RAW_URL:find("USERNAME/REPO_NAME") then return end
   local fetchUrl = GITHUB_RAW_URL .. "?t=" .. tostring(os.time())
 
-  if http and http.get then
-    http.get(fetchUrl, function(code, content)
+  local httpEngine = http or Http
+  if httpEngine and httpEngine.get then
+    httpEngine.get(fetchUrl, function(code, content)
       if code == 200 and content and #content >= 200 then
         local remoteVersion = content:match('local%s+CURRENT_VERSION%s*=%s*["\']([^"\']+)["\']')
         if remoteVersion and isNewerVersion(remoteVersion, CURRENT_VERSION) then
-          local localPath = getScriptFilePath()
-          if localPath then saveNewScript(content, localPath) end
+          showUpdateAvailableDialog(remoteVersion, content)
         end
       end
     end)
@@ -248,7 +298,6 @@ local function bitmapToBase64(bitmap, isVideoMode)
   local targetQuality = 75
   local limit = 720
 
-  -- Pada mode video, resolusi diturunkan satu tingkat agar token & memori tetap aman
   if resMode == "original" then
     limit = isVideoMode and 720 or 0
     targetQuality = isVideoMode and 75 or 85
@@ -1005,7 +1054,6 @@ startScreenDescription = function()
                             pcall(function() frames[2].recycle() end)
                             pcall(function() frames[3].recycle() end)
 
-                            -- true: Mengaktifkan optimasi resolusi khusus mode video
                             base64Screen = bitmapToBase64(stitched, true)
                           end)
 
@@ -1067,7 +1115,6 @@ startScreenDescription = function()
 
         Thread(Runnable{
           run = function()
-            -- false: Menggunakan resolusi penuh sesuai setelan pengguna
             local base64Screen = bitmapToBase64(bitmap, false)
             mainHandler.post(Runnable{
               run = function()
