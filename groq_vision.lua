@@ -29,6 +29,8 @@ import "java.lang.String"
 import "java.lang.Runnable"
 import "android.os.Handler"
 import "android.os.Looper"
+import "java.util.HashMap"
+import "com.androlua.Http"
 
 local mainHandler = Handler(Looper.getMainLooper())
 
@@ -284,7 +286,7 @@ local function bitmapToBase64(bitmap)
 end
 
 -- ====================================================================
--- GROQ API ASINKRON DENGAN PENGULANGAN 3 KALI (BEBAS MACET)
+-- GROQ API ASINKRON BEBAS KUNCI LUA (KURSOR BEBAS BERGERAK)
 -- ====================================================================
 local function sendGroqChat(userText, mediaData, onComplete)
   local apiKey = getApiKey()
@@ -351,10 +353,11 @@ local function sendGroqChat(userText, mediaData, onComplete)
 
   local payloadStr = jsonPayload.toString()
   local endpoint = "https://api.groq.com/openai/v1/chat/completions"
-  local headers = {
-    ["Content-Type"] = "application/json; charset=UTF-8",
-    ["Authorization"] = "Bearer " .. apiKey
-  }
+
+  -- Konversi Header ke HashMap Java murni agar dapat diproses oleh engine C/Java tanpa error tipe data
+  local headerMap = HashMap()
+  headerMap.put("Content-Type", "application/json; charset=UTF-8")
+  headerMap.put("Authorization", "Bearer " .. apiKey)
 
   local maxRetries = 3
   local attempt = 0
@@ -362,116 +365,115 @@ local function sendGroqChat(userText, mediaData, onComplete)
   local function executeRequest()
     attempt = attempt + 1
 
-    if http and http.post then
-      http.post(endpoint, payloadStr, headers, function(code, content)
-        if code == 200 and content then
-          local ok, parseErr = pcall(function()
-            local resObj = JSONObject(content)
-            local choices = resObj.optJSONArray("choices")
-            if choices and choices.length() > 0 then
-              local choiceMsg = choices.getJSONObject(0).optJSONObject("message")
-              if choiceMsg then
-                local text = choiceMsg.optString("content")
-                mainHandler.post(Runnable{
-                  run = function()
-                    table.insert(chatHistory, { role = "assistant", content = text })
-                    onComplete(true, text)
-                  end
-                })
-                return
+    local function handleResult(code, content)
+      mainHandler.post(Runnable{
+        run = function()
+          if code == 200 and content and #content > 0 then
+            local ok, parseErr = pcall(function()
+              local resObj = JSONObject(content)
+              local choices = resObj.optJSONArray("choices")
+              if choices and choices.length() > 0 then
+                local choiceMsg = choices.getJSONObject(0).optJSONObject("message")
+                if choiceMsg then
+                  local text = choiceMsg.optString("content")
+                  table.insert(chatHistory, { role = "assistant", content = text })
+                  onComplete(true, text)
+                  return
+                end
               end
-            end
-            error("Respon server kosong")
-          end)
-
-          if ok then return end
-        end
-
-        if attempt < maxRetries then
-          mainHandler.postDelayed(Runnable{
-            run = function()
-              executeRequest()
-            end
-          }, 1500)
-        else
-          local errMsg = "Gagal memproses permintaan setelah " .. attempt .. "x percobaan."
-          if content then
-            pcall(function()
-              local errObj = JSONObject(content).optJSONObject("error")
-              if errObj then errMsg = errObj.optString("message") .. " (" .. attempt .. "x gagal)" end
+              error("Respon server kosong")
             end)
+            if ok then return end
           end
-          mainHandler.post(Runnable{
-            run = function()
-              onComplete(false, errMsg)
+
+          -- Pengulangan otomatis hingga 3 kali
+          if attempt < maxRetries then
+            mainHandler.postDelayed(Runnable{
+              run = function()
+                executeRequest()
+              end
+            }, 1500)
+          else
+            local errMsg = "Gagal memproses permintaan setelah " .. attempt .. "x percobaan."
+            if content then
+              pcall(function()
+                local errObj = JSONObject(content).optJSONObject("error")
+                if errObj then
+                  errMsg = errObj.optString("message") .. " (" .. attempt .. "x gagal)"
+                end
+              end)
             end
-          })
+            onComplete(false, errMsg)
+          end
         end
+      })
+    end
+
+    -- Panggil Http.post bawaan Java yang sepenuhnya non-blocking terhadap UI
+    local httpEngine = http or Http
+    local dispatched = false
+
+    if httpEngine and httpEngine.post then
+      -- Signature 1: (url, data, headerMap, callback)
+      local ok = pcall(function()
+        httpEngine.post(endpoint, payloadStr, headerMap, function(code, content)
+          handleResult(code, content)
+        end)
       end)
-    else
+      if ok then
+        dispatched = true
+      else
+        -- Signature 2: (url, data, cookie, charset, headerMap, callback)
+        ok = pcall(function()
+          httpEngine.post(endpoint, payloadStr, "", "UTF-8", headerMap, function(code, content)
+            handleResult(code, content)
+          end)
+        end)
+        if ok then dispatched = true end
+      end
+    end
+
+    -- Fallback aman jika engine http.post tidak terpasang
+    if not dispatched then
       Thread(Runnable{
         run = function()
-          local success = false
-          local finalResult = nil
-          local errDetail = ""
+          local postData = String(payloadStr).getBytes("UTF-8")
+          local resCode = 0
+          local resContent = nil
+          pcall(function()
+            local url = URL(endpoint)
+            local conn = url.openConnection()
+            conn.setRequestMethod("POST")
+            conn.setInstanceFollowRedirects(false)
+            conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8")
+            conn.setRequestProperty("Authorization", "Bearer " .. apiKey)
+            conn.setDoOutput(true)
+            conn.setDoInput(true)
+            conn.setConnectTimeout(12000)
+            conn.setReadTimeout(25000)
 
-          while attempt <= maxRetries and not success do
-            local postData = String(payloadStr).getBytes("UTF-8")
-            pcall(function()
-              local url = URL(endpoint)
-              local conn = url.openConnection()
-              conn.setRequestMethod("POST")
-              conn.setInstanceFollowRedirects(false)
-              conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8")
-              conn.setRequestProperty("Authorization", "Bearer " .. apiKey)
-              conn.setDoOutput(true)
-              conn.setDoInput(true)
-              conn.setConnectTimeout(12000)
-              conn.setReadTimeout(25000)
+            local os = conn.getOutputStream()
+            os.write(postData)
+            os.flush()
+            os.close()
 
-              local os = conn.getOutputStream()
-              os.write(postData)
-              os.flush()
-              os.close()
-
-              if conn.getResponseCode() == 200 then
-                local reader = BufferedReader(InputStreamReader(conn.getInputStream(), "UTF-8"))
-                local lines = {}
-                local line = reader.readLine()
-                while line ~= nil do
-                  table.insert(lines, line)
-                  line = reader.readLine()
-                end
-                reader.close()
-                local choices = JSONObject(table.concat(lines, "\n")).optJSONArray("choices")
-                if choices and choices.length() > 0 then
-                  finalResult = choices.getJSONObject(0).optJSONObject("message").optString("content")
-                  success = true
-                end
-              else
-                errDetail = "HTTP Error " .. tostring(conn.getResponseCode())
+            resCode = conn.getResponseCode()
+            local stream = (resCode == 200) and conn.getInputStream() or conn.getErrorStream()
+            if stream then
+              local reader = BufferedReader(InputStreamReader(stream, "UTF-8"))
+              local lines = {}
+              local line = reader.readLine()
+              while line ~= nil do
+                table.insert(lines, line)
+                line = reader.readLine()
               end
-              conn.disconnect()
-            end)
-
-            if not success then
-              attempt = attempt + 1
-              if attempt <= maxRetries then
-                pcall(function() Thread.sleep(1500) end)
-              end
+              reader.close()
+              resContent = table.concat(lines, "\n")
             end
-          end
+            conn.disconnect()
+          end)
 
-          mainHandler.post(Runnable{
-            run = function()
-              if success and finalResult then
-                table.insert(chatHistory, { role = "assistant", content = finalResult })
-                onComplete(true, finalResult)
-              else
-                onComplete(false, errDetail ~= "" and (errDetail .. " (Gagal " .. maxRetries .. "x)") or "Koneksi gagal setelah 3x percobaan.")
-              end
-            end
-          })
+          handleResult(resCode, resContent)
         end
       }).start()
     end
