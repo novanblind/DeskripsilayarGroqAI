@@ -224,104 +224,159 @@ local function saveNewScript(newCode, targetPath)
   return success
 end
 
-checkAppUpdate = function(isManual)
-  if GITHUB_RAW_URL:find("USERNAME/REPO_NAME") then
-    if isManual then
-      service.speak("URL GitHub belum dikonfigurasi. Silakan periksa variabel GITHUB_RAW_URL.")
-    end
-    return
-  end
-
-  if isManual then
-    service.speak("Memeriksa pembaruan...")
-  end
-
+-- Fallback koneksi HTTP via Java jika http.get tidak tersedia
+local function fetchViaHttpUrlConnection(fetchUrl, callback)
   Thread(Runnable{
     run = function()
       local conn = nil
       local reader = nil
       local remoteContent = nil
-      local isSuccess = false
       local errDetail = ""
+      local ok, pErr = pcall(function()
+        local currentUrl = fetchUrl
+        local maxRedirects = 3
+        for i = 1, maxRedirects do
+          local url = URL(currentUrl)
+          conn = url.openConnection()
+          conn.setRequestMethod("GET")
+          conn.setInstanceFollowRedirects(true)
+          conn.setRequestProperty("User-Agent", "Mozilla/5.0")
+          conn.setConnectTimeout(10000)
+          conn.setReadTimeout(15000)
 
-      pcall(function()
-        local fetchUrl = GITHUB_RAW_URL .. "?t=" .. tostring(os.time())
-        local url = URL(fetchUrl)
-        conn = url.openConnection()
-        conn.setRequestMethod("GET")
-        conn.setInstanceFollowRedirects(true)
-        conn.setRequestProperty("User-Agent", "Mozilla/5.0")
-        conn.setConnectTimeout(10000)
-        conn.setReadTimeout(15000)
-
-        if conn.getResponseCode() == 200 then
-          reader = BufferedReader(InputStreamReader(conn.getInputStream(), "UTF-8"))
-          local lines = {}
-          local line = reader.readLine()
-          while line ~= nil do
-            table.insert(lines, line)
-            line = reader.readLine()
+          local resCode = conn.getResponseCode()
+          if resCode == 301 or resCode == 302 or resCode == 307 or resCode == 308 then
+            currentUrl = conn.getHeaderField("Location")
+            conn.disconnect()
+          elseif resCode == 200 then
+            reader = BufferedReader(InputStreamReader(conn.getInputStream(), "UTF-8"))
+            local lines = {}
+            local line = reader.readLine()
+            while line ~= nil do
+              table.insert(lines, line)
+              line = reader.readLine()
+            end
+            reader.close()
+            remoteContent = table.concat(lines, "\n")
+            break
+          else
+            errDetail = "HTTP Code: " .. tostring(resCode)
+            break
           end
-          reader.close()
-          remoteContent = table.concat(lines, "\n")
-          isSuccess = true
-        else
-          errDetail = "HTTP Code: " .. tostring(conn.getResponseCode())
         end
       end)
 
       if reader then pcall(function() reader.close() end) end
       if conn then pcall(function() conn.disconnect() end) end
 
-      mainHandler.post(Runnable{
-        run = function()
-          if not isSuccess or not remoteContent then
-            if isManual then
-              service.speak("Gagal memeriksa pembaruan. " .. errDetail)
-            end
-            return
-          end
+      if not ok and errDetail == "" then
+        errDetail = tostring(pErr)
+      end
 
-          local remoteVersion = remoteContent:match('local%s+CURRENT_VERSION%s*=%s*["\']([^"\']+)["\']')
-            or remoteContent:match('@version%s+([%d%.]+)')
-
-          if remoteVersion and isNewerVersion(remoteVersion, CURRENT_VERSION) then
-            local function promptUpdateDialog()
-              service.speak("Pembaruan versi " .. remoteVersion .. " tersedia.")
-              local builder = AlertDialog.Builder(service)
-                .setTitle("Pembaruan Tersedia")
-                .setMessage("Versi baru (" .. remoteVersion .. ") telah dirilis di GitHub.\nVersi saat ini: " .. CURRENT_VERSION .. "\n\nPerbarui script sekarang?")
-                .setPositiveButton("Perbarui", function()
-                  local localPath = getScriptFilePath()
-                  if localPath and saveNewScript(remoteContent, localPath) then
-                    service.speak("Pembaruan berhasil dipasang. Silakan jalankan ulang plugin.")
-                    local successDialog = AlertDialog.Builder(service)
-                      .setTitle("Sukses")
-                      .setMessage("Script berhasil diperbarui ke versi " .. remoteVersion .. "!\nKunci API lokal Anda tetap aman dan tidak terhapus.\nSilakan jalankan ulang plugin.")
-                      .setPositiveButton("OK", nil)
-                    displayOverlayDialog(successDialog)
-                  else
-                    service.speak("Gagal menyimpan file script baru ke penyimpanan lokal.")
-                  end
-                end)
-                .setNegativeButton("Nanti", nil)
-              displayOverlayDialog(builder)
-            end
-
-            if isScanningScreen and not isManual then
-              pendingUpdateAction = promptUpdateDialog
-            else
-              promptUpdateDialog()
-            end
-          else
-            if isManual then
-              service.speak("Script sudah menggunakan versi terbaru (v" .. CURRENT_VERSION .. ").")
-            end
-          end
-        end
-      })
+      callback(remoteContent, errDetail)
     end
   }).start()
+end
+
+checkAppUpdate = function(isManual)
+  if GITHUB_RAW_URL:find("USERNAME/REPO_NAME") then
+    if isManual then
+      local builder = AlertDialog.Builder(service)
+        .setTitle("Pembaruan Script")
+        .setMessage("URL GitHub belum dikonfigurasi. Silakan periksa variabel GITHUB_RAW_URL pada script.")
+        .setPositiveButton("OK", nil)
+      displayOverlayDialog(builder)
+      service.speak("URL GitHub belum dikonfigurasi.")
+    end
+    return
+  end
+
+  if isManual then
+    mainHandler.postDelayed(Runnable{
+      run = function()
+        service.speak("Memeriksa pembaruan ke server...")
+      end
+    }, 200)
+  end
+
+  local fetchUrl = GITHUB_RAW_URL .. "?t=" .. tostring(os.time())
+
+  local function handleRemoteContent(remoteContent, errDetail)
+    mainHandler.post(Runnable{
+      run = function()
+        if not remoteContent or #remoteContent == 0 then
+          if isManual then
+            local errorMsg = "Gagal memeriksa pembaruan. " .. (errDetail ~= "" and ("(" .. errDetail .. ")") or "Tidak dapat terhubung ke server.")
+            local builder = AlertDialog.Builder(service)
+              .setTitle("Pemeriksaan Gagal")
+              .setMessage(errorMsg .. "\nPastikan koneksi internet Anda aktif.")
+              .setPositiveButton("OK", nil)
+            displayOverlayDialog(builder)
+            service.speak(errorMsg)
+          end
+          return
+        end
+
+        local remoteVersion = remoteContent:match('local%s+CURRENT_VERSION%s*=%s*["\']([^"\']+)["\']')
+          or remoteContent:match('@version%s+([%d%.]+)')
+
+        if remoteVersion and isNewerVersion(remoteVersion, CURRENT_VERSION) then
+          local function promptUpdateDialog()
+            service.speak("Pembaruan versi " .. remoteVersion .. " tersedia.")
+            local builder = AlertDialog.Builder(service)
+              .setTitle("Pembaruan Tersedia")
+              .setMessage("Versi baru (" .. remoteVersion .. ") telah dirilis di GitHub.\nVersi saat ini: " .. CURRENT_VERSION .. "\n\nPerbarui script sekarang?")
+              .setPositiveButton("Perbarui", function()
+                local localPath = getScriptFilePath()
+                if localPath and saveNewScript(remoteContent, localPath) then
+                  service.speak("Pembaruan berhasil dipasang. Silakan jalankan ulang plugin.")
+                  local successDialog = AlertDialog.Builder(service)
+                    .setTitle("Sukses")
+                    .setMessage("Script berhasil diperbarui ke versi " .. remoteVersion .. "!\nKunci API lokal Anda tetap aman dan tidak terhapus.\nSilakan jalankan ulang plugin.")
+                    .setPositiveButton("OK", nil)
+                  displayOverlayDialog(successDialog)
+                else
+                  service.speak("Gagal menyimpan file script baru ke penyimpanan lokal.")
+                end
+              end)
+              .setNegativeButton("Nanti", nil)
+            displayOverlayDialog(builder)
+          end
+
+          if isScanningScreen and not isManual then
+            pendingUpdateAction = promptUpdateDialog
+          else
+            promptUpdateDialog()
+          end
+        else
+          -- Jika sudah versi terbaru, selalu tampilkan dialog jika diperiksa manual
+          if isManual then
+            local latestMsg = "Script sudah menggunakan versi terbaru (v" .. CURRENT_VERSION .. ")."
+            local builder = AlertDialog.Builder(service)
+              .setTitle("Versi Terbaru")
+              .setMessage(latestMsg .. "\nBelum ada pembaruan baru yang dirilis di GitHub.")
+              .setPositiveButton("OK", nil)
+            displayOverlayDialog(builder)
+            service.speak(latestMsg)
+          end
+        end
+      end
+    })
+  end
+
+  -- Coba gunakan engine http.get bawaan Jieshuo terlebih dahulu
+  if http and http.get then
+    http.get(fetchUrl, function(code, content)
+      if code == 200 and content and #content > 0 then
+        handleRemoteContent(content, "")
+      else
+        -- Fallback ke HttpURLConnection jika http.get gagal
+        fetchViaHttpUrlConnection(fetchUrl, handleRemoteContent)
+      end
+    end)
+  else
+    fetchViaHttpUrlConnection(fetchUrl, handleRemoteContent)
+  end
 end
 
 -- ====================================================================
@@ -331,8 +386,7 @@ local function bitmapToBase64(bitmap, quality)
   local targetQuality = quality or 85
   local w = bitmap.getWidth()
   local h = bitmap.getHeight()
-  
-  -- Optimasi resolusi: Batasi lebar maks 1080px agar teks tetap tajam namun pemrosesan cepat
+
   local maxWidth = 1080
   local scale = 1.0
   if w > maxWidth then
@@ -414,7 +468,7 @@ local function sendGroqChat(userText, mediaData, onComplete)
       for _, msg in ipairs(chatHistory) do
         local msgObj = JSONObject()
         msgObj.put("role", msg.role)
-        
+
         if type(msg.content) == "string" then
           msgObj.put("content", msg.content)
         elseif type(msg.content) == "table" then
@@ -543,7 +597,7 @@ showChatDialog = function()
   local chatLog = TextView(service)
   chatLog.setTextSize(16)
   chatLog.setTextIsSelectable(true)
-  
+
   local function refreshChatLog()
     local pieces = {}
     for _, msg in ipairs(chatHistory) do
@@ -580,7 +634,7 @@ showChatDialog = function()
 
   local inputLayout = LinearLayout(service)
   inputLayout.setOrientation(LinearLayout.HORIZONTAL)
-  
+
   local editMsg = EditText(service)
   editMsg.setHint("Tanyakan detail lainnya...")
   local editParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1)
@@ -687,7 +741,6 @@ showApiKeyDialog = function()
   displayOverlayDialog(builder)
 end
 
--- Memulai Pemindaian Layar Secara Asinkron (Jalur Belakang)
 startScreenDescription = function()
   if getApiKey() == "" then
     isScanningScreen = false
@@ -712,8 +765,6 @@ startScreenDescription = function()
       pcall(function()
         service.takeScreenshot(Display.DEFAULT_DISPLAY, service.getMainExecutor(), TakeScreenshotCallback{
           onSuccess = function(screenshotResult)
-            -- PINDAHKAN SELURUH PENGOLAHAN GAMBAR KE BACKGROUND THREAD
-            -- Agar UI Thread Jieshuo tidak macet dan kursor tetap bebas digerakkan
             Thread(Runnable{
               run = function()
                 local base64Screen = nil
@@ -735,10 +786,10 @@ startScreenDescription = function()
                       service.speak("Menganalisis dengan Groq...")
                     end
                   })
-                  
+
                   chatHistory = {}
                   currentSysInstruction = getImageInstruction()
-                  
+
                   sendGroqChat("Deskripsikan konten utama pada layar ini secara terperinci tanpa menyebutkan bilah status atas maupun bilah navigasi bawah.", base64Screen, function(success, reply)
                     isScanningScreen = false
                     if success then
@@ -813,11 +864,11 @@ local function showModeSelectionDialog()
     "Mode Langsung - Deskripsikan Layar",
     "Mode Normal - Buka Menu Utama"
   }
-  
+
   local currentMode = getAppMode()
   local selectedIndex = 0
-  if currentMode == "normal" then 
-    selectedIndex = 1 
+  if currentMode == "normal" then
+    selectedIndex = 1
   end
 
   local builder = AlertDialog.Builder(service)
@@ -846,7 +897,7 @@ showMainMenu = function()
   elseif getApiKey() ~= "" then
     currentKeyStatus = "Bawaan Aktif"
   end
-  
+
   local menuItems = {
     "1. Deskripsikan Layar",
     "2. Atur Kunci API Groq (" .. currentKeyStatus .. ")",
@@ -859,15 +910,15 @@ showMainMenu = function()
     .setTitle("Deskripsi Layar Groq AI (v" .. CURRENT_VERSION .. ")")
     .setItems(menuItems, function(dialog, which)
       dialog.dismiss()
-      if which == 0 then 
+      if which == 0 then
         startScreenDescription()
-      elseif which == 1 then 
+      elseif which == 1 then
         showApiKeyDialog()
-      elseif which == 2 then 
+      elseif which == 2 then
         showModeSelectionDialog()
-      elseif which == 3 then 
+      elseif which == 3 then
         showImageInstructionDialog()
-      elseif which == 4 then 
+      elseif which == 4 then
         checkAppUpdate(true)
       end
     end)
