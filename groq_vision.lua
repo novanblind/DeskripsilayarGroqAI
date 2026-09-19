@@ -35,7 +35,7 @@ local mainHandler = Handler(Looper.getMainLooper())
 -- ====================================================================
 -- KONFIGURASI VERSI & GITHUB AUTO-UPDATE
 -- ====================================================================
-local CURRENT_VERSION = "2.0.0"
+local CURRENT_VERSION = "2.0.1"
 
 -- URL RAW GitHub repositori Anda
 local GITHUB_RAW_URL = "https://raw.githubusercontent.com/novanblind/DeskripsilayarGroqAI/main/groq_vision.lua"
@@ -52,11 +52,6 @@ Jika terdapat manusia atau karakter, gambarkan penampilan, pakaian, ekspresi, ar
 Jika gambar berisi surat, dokumen, formulir, poster, papan, atau teks lainnya, bacakan dan transkripsikan seluruh teks yang terlihat secara akurat. Pertahankan urutan pembacaan sesuai tata letak gambar.
 
 Jangan gunakan pembuka umum seperti 'Gambar ini menunjukkan...', penomoran, bullet point, subjudul, atau kategori. Dasarkan setiap pernyataan pada hal yang benar-benar terlihat; nyatakan ketidakpastian jika diperlukan. Pastikan isi surat atau dokumen disampaikan secara lengkap sebelum memberikan deskripsi visual dan kesan suasana keseluruhan.]]
-
--- Daftar Model Groq Vision Aktif
-local availableModels = {
-  "qwen/qwen3.8-27b"
-}
 
 -- SharedPreferences Groq khusus Deskripsi Visual
 local sp = service.getSharedPreferences("groq_vision_desc_config", Context.MODE_PRIVATE)
@@ -92,7 +87,7 @@ local function getScriptDir()
   return "/sdcard/jieshuo/plugin/Deskripsi Layar Groq/"
 end
 
--- Fungsi membaca API Key dari api_key.txt di HP
+-- Fungsi membaca kunci bawaan dari file lokal api_key.txt
 local function readLocalApiKeyFile()
   local dir = getScriptDir()
   local candidates = {
@@ -118,7 +113,7 @@ local function readLocalApiKeyFile()
   return ""
 end
 
--- Fungsi menyimpan kunci API ke api_key.txt saat diubah melalui dialog
+-- Fungsi menyimpan kunci API ke api_key.txt jika file belum ada
 local function saveLocalApiKeyFile(key)
   local dir = getScriptDir()
   local target = dir .. "api_key.txt"
@@ -135,11 +130,11 @@ local function saveLocalApiKeyFile(key)
 end
 
 local function getApiKey()
-  -- 1. Cek SharedPreferences
+  -- 1. Cek SharedPreferences (jika pengguna menyetel kunci kustom)
   local key = sp.getString("api_key", "")
   if key ~= nil and key ~= "" then return key end
 
-  -- 2. Cek file lokal api_key.txt
+  -- 2. Cek file lokal api_key.txt (kunci bawaan)
   local fileKey = readLocalApiKeyFile()
   if fileKey ~= "" then return fileKey end
 
@@ -149,7 +144,8 @@ end
 
 local function setApiKey(k)
   sp.edit().putString("api_key", k).apply()
-  if k ~= "" then
+  -- Jika file api_key.txt belum ada, simpan juga sebagai cadangan
+  if readLocalApiKeyFile() == "" and k ~= "" then
     saveLocalApiKeyFile(k)
   end
 end
@@ -321,7 +317,6 @@ checkAppUpdate = function(isManual)
               displayOverlayDialog(builder)
             end
 
-            -- Jika sedang memindai layar dan bukan pengecekan manual, tunda dialognya
             if isScanningScreen and not isManual then
               pendingUpdateAction = promptUpdateDialog
             else
@@ -591,7 +586,7 @@ showChatDialog = function()
   local builder = AlertDialog.Builder(service)
     .setTitle("Hasil Deskripsi Layar")
     .setView(layout)
-    .setPositiveButton("Menu / Setelan", function(dialog)
+    .setPositiveButton("Pengaturan", function(dialog)
       dialog.dismiss()
       showMainMenu()
     end)
@@ -637,6 +632,7 @@ showChatDialog = function()
   end)
 end
 
+-- Dialog Pengaturan Kunci API (Lengkap dengan Tombol Reset Bawaan)
 showApiKeyDialog = function()
   local input = EditText(service)
   input.setText(getApiKey())
@@ -649,8 +645,21 @@ showApiKeyDialog = function()
     .setPositiveButton("Simpan", function()
       local key = tostring(input.getText()):gsub("^%s*(.-)%s*$", "%1")
       setApiKey(key)
-      if key ~= "" then service.speak("Kunci API Groq berhasil disimpan ke penyimpanan lokal.")
-      else service.speak("Kunci API dikosongkan.") end
+      if key ~= "" then 
+        service.speak("Kunci API Groq berhasil disimpan.")
+      else 
+        service.speak("Kunci API dikosongkan.") 
+      end
+    end)
+    .setNeutralButton("Reset Bawaan", function()
+      -- Hapus kunci kustom dari SharedPreferences
+      sp.edit().remove("api_key").apply()
+      local defaultKey = readLocalApiKeyFile()
+      if defaultKey ~= "" then
+        service.speak("Kunci API dikembalikan ke setelan bawaan.")
+      else
+        service.speak("Kunci API di-reset. Pastikan file api_key.txt terisi kunci bawaan.")
+      end
     end)
     .setNegativeButton("Batal", nil)
 
@@ -704,7 +713,6 @@ startScreenDescription = function()
                     service.speak(errMsg)
                     showChatDialog()
                   end
-                  -- Jalankan pengecekan pembaruan tertunda jika ada update dari GitHub
                   triggerPendingUpdateIfAny()
                 end)
               else
@@ -730,59 +738,6 @@ startScreenDescription = function()
       end)
     end
   }, 250)
-end
-
-local function showCustomModelDialog()
-  local input = EditText(service)
-  input.setText(getModelName())
-  input.setHint("qwen/qwen3.8-27b")
-
-  local builder = AlertDialog.Builder(service)
-    .setTitle("Model Groq Custom")
-    .setView(input)
-    .setPositiveButton("Simpan", function()
-      local customModel = tostring(input.getText()):gsub("^%s*(.-)%s*$", "%1")
-      if customModel ~= "" then
-        setModelName(customModel)
-        service.speak("Model diatur ke " .. customModel)
-      end
-    end)
-    .setNegativeButton("Batal", nil)
-
-  displayOverlayDialog(builder)
-end
-
-local function showModelSelectionDialog()
-  local models = {}
-  for _, m in ipairs(availableModels) do
-    table.insert(models, m)
-  end
-  table.insert(models, "[Ketik Nama Model Lain]")
-  
-  local currentModel = getModelName()
-  local selectedIndex = 0
-  for i, model in ipairs(models) do
-    if model == currentModel then
-      selectedIndex = i - 1
-      break
-    end
-  end
-
-  local builder = AlertDialog.Builder(service)
-    .setTitle("Pilih Model Groq Vision")
-    .setSingleChoiceItems(models, selectedIndex, function(dialog, which)
-      local chosenModel = models[which + 1]
-      dialog.dismiss()
-      if chosenModel == "[Ketik Nama Model Lain]" then
-        showCustomModelDialog()
-      else
-        setModelName(chosenModel)
-        service.speak("Model diubah ke " .. chosenModel)
-      end
-    end)
-    .setNegativeButton("Tutup", nil)
-
-  displayOverlayDialog(builder)
 end
 
 local function showImageInstructionDialog()
@@ -845,9 +800,8 @@ showMainMenu = function()
     "1. Deskripsikan Layar",
     "2. Atur Kunci API Groq (" .. currentKeyStatus .. ")",
     "3. Pengaturan Mode Peluncuran",
-    "4. Model Vision Groq (Aktif: " .. getModelName() .. ")",
-    "5. Atur Instruksi Deskripsi Layar",
-    "6. Periksa Pembaruan Script (v" .. CURRENT_VERSION .. ")"
+    "4. Atur Instruksi Deskripsi Layar",
+    "5. Periksa Pembaruan Script (v" .. CURRENT_VERSION .. ")"
   }
 
   local builder = AlertDialog.Builder(service)
@@ -857,9 +811,8 @@ showMainMenu = function()
       if which == 0 then startScreenDescription()
       elseif which == 1 then showApiKeyDialog()
       elseif which == 2 then showModeSelectionDialog()
-      elseif which == 3 then showModelSelectionDialog()
-      elseif which == 4 then showImageInstructionDialog()
-      elseif which == 5 then checkAppUpdate(true)
+      elseif which == 3 then showImageInstructionDialog()
+      elseif which == 4 then checkAppUpdate(true)
       end
     end)
     .setNegativeButton("Tutup", nil)
@@ -872,16 +825,13 @@ end
 -- ====================================================================
 local startMode = getAppMode()
 if startMode == "direct_image" or startMode == "direct" then
-  -- Jalankan deskripsi langsung
   startScreenDescription()
-  -- Tetap periksa pembaruan di latar belakang tanpa mengganggu
   mainHandler.postDelayed(Runnable{
     run = function()
       checkAppUpdate(false)
     end
   }, 1000)
 else
-  -- Mode normal: buka menu utama
   showMainMenu()
   mainHandler.postDelayed(Runnable{
     run = function()
