@@ -39,7 +39,7 @@ local mainHandler = Handler(Looper.getMainLooper())
 -- ====================================================================
 -- KONFIGURASI VERSI & GITHUB AUTO-UPDATE
 -- ====================================================================
-local CURRENT_VERSION = "2.0.4"
+local CURRENT_VERSION = "2.0.5"
 local GITHUB_RAW_URL = "https://raw.githubusercontent.com/novanblind/DeskripsilayarGroqAI/main/groq_vision.lua"
 
 local defaultApiKey = ""
