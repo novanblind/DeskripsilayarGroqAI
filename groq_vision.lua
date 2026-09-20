@@ -76,15 +76,22 @@ local function getScriptFilePath()
   if src and src:sub(1, 1) == "@" then
     return src:sub(2)
   end
-  local fallbackPaths = {
-    "/sdcard/jieshuo/plugin/Deskripsi Layar Groq/main.lua",
-    "/sdcard/jieshuo/plugin/DeskripsilayarGroqAI/groq_vision.lua",
-    "/sdcard/jieshuo/plugin/DeskripsiLayarGroq/main.lua"
+  local candidateDirs = {
+    "/sdcard/jieshuo/plugin/DeskripsilayarGroqAI/",
+    "/storage/emulated/0/jieshuo/plugin/DeskripsilayarGroqAI/",
+    "/sdcard/jieshuo/plugin/Deskripsi Layar Groq/",
+    "/storage/emulated/0/jieshuo/plugin/Deskripsi Layar Groq/",
+    "/sdcard/jieshuo/plugin/DeskripsiLayarGroq/",
+    "/storage/emulated/0/jieshuo/plugin/DeskripsiLayarGroq/"
   }
-  for _, path in ipairs(fallbackPaths) do
-    if File(path).exists() then return path end
+  local candidateNames = {"main.lua", "groq_vision.lua"}
+  for _, dir in ipairs(candidateDirs) do
+    for _, name in ipairs(candidateNames) do
+      local p = dir .. name
+      if File(p).exists() then return p end
+    end
   end
-  return nil
+  return "/sdcard/jieshuo/plugin/DeskripsilayarGroqAI/main.lua"
 end
 
 local function getScriptDir()
@@ -92,7 +99,7 @@ local function getScriptDir()
   if path then
     return path:match("(.*/)")
   end
-  return "/sdcard/jieshuo/plugin/Deskripsi Layar Groq/"
+  return "/sdcard/jieshuo/plugin/DeskripsilayarGroqAI/"
 end
 
 local function readLocalApiKeyFile()
@@ -223,13 +230,27 @@ local function saveNewScript(newCode, targetPath)
   return success
 end
 
+local function showNoUpdateDialog()
+  mainHandler.post(Runnable{
+    run = function()
+      local builder = AlertDialog.Builder(service)
+        .setTitle("Tidak Ada Versi Baru")
+        .setMessage("Anda sudah menggunakan versi terbaru: " .. CURRENT_VERSION)
+        .setPositiveButton("Oke", function(dialog)
+          dialog.dismiss()
+        end)
+      displayOverlayDialog(builder)
+      pcall(function() service.speak("Tidak ada versi baru. Versi saat ini: " .. CURRENT_VERSION) end)
+    end
+  })
+end
+
 local function showDownloadCompleteDialog(newVersion)
   mainHandler.post(Runnable{
     run = function()
-      local message = "Pembaruan versi " .. tostring(newVersion) .. " berhasil diunduh dan dipasang."
       local builder = AlertDialog.Builder(service)
         .setTitle("Download Selesai")
-        .setMessage(message)
+        .setMessage("Pembaruan ke versi " .. tostring(newVersion) .. " berhasil diunduh dan dipasang. Silakan buka kembali plugin untuk menerapkan.")
         .setPositiveButton("Oke", function(dialog)
           dialog.dismiss()
         end)
@@ -242,13 +263,13 @@ end
 local function showUpdateAvailableDialog(remoteVersion, newScriptCode)
   mainHandler.post(Runnable{
     run = function()
-      local message = "Versi baru tersedia: " .. tostring(remoteVersion) .. "\nVersi yang Anda gunakan: " .. tostring(CURRENT_VERSION)
+      local message = "Versi baru tersedia: " .. tostring(remoteVersion) .. "\nVersi yang digunakan: " .. tostring(CURRENT_VERSION)
       local builder = AlertDialog.Builder(service)
         .setTitle("Versi Baru Tersedia")
         .setMessage(message)
         .setPositiveButton("Perbarui", function(dialog)
           dialog.dismiss()
-          service.speak("Sedang memperbarui...")
+          service.speak("Sedang mengunduh pembaruan...")
           Thread(Runnable{
             run = function()
               local localPath = getScriptFilePath()
@@ -257,7 +278,7 @@ local function showUpdateAvailableDialog(remoteVersion, newScriptCode)
               else
                 mainHandler.post(Runnable{
                   run = function()
-                    service.speak("Gagal menyimpan pembaruan.")
+                    service.speak("Gagal menyimpan berkas pembaruan.")
                   end
                 })
               end
@@ -273,21 +294,72 @@ local function showUpdateAvailableDialog(remoteVersion, newScriptCode)
   })
 end
 
-checkAppUpdate = function()
+checkAppUpdate = function(isManual)
   if GITHUB_RAW_URL:find("USERNAME/REPO_NAME") then return end
   local fetchUrl = GITHUB_RAW_URL .. "?t=" .. tostring(os.time())
 
-  local httpEngine = http or Http
-  if httpEngine and httpEngine.get then
-    httpEngine.get(fetchUrl, function(code, content)
-      if code == 200 and content and #content >= 200 then
-        local remoteVersion = content:match('local%s+CURRENT_VERSION%s*=%s*["\']([^"\']+)["\']')
+  if isManual then
+    service.speak("Memeriksa versi baru...")
+  end
+
+  Thread(Runnable{
+    run = function()
+      local content = nil
+      local resCode = 0
+
+      pcall(function()
+        local url = URL(fetchUrl)
+        local conn = url.openConnection()
+        conn.setRequestMethod("GET")
+        conn.setConnectTimeout(10000)
+        conn.setReadTimeout(15000)
+        conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Android; Mobile)")
+        conn.setRequestProperty("Cache-Control", "no-cache")
+        conn.setInstanceFollowRedirects(true)
+
+        resCode = conn.getResponseCode()
+        if resCode == 200 then
+          local stream = conn.getInputStream()
+          local reader = BufferedReader(InputStreamReader(stream, "UTF-8"))
+          local lines = {}
+          local line = reader.readLine()
+          while line ~= nil do
+            table.insert(lines, line)
+            line = reader.readLine()
+          end
+          reader.close()
+          content = table.concat(lines, "\n")
+        end
+        conn.disconnect()
+      end)
+
+      if resCode == 200 and content and #content >= 200 then
+        local remoteVersion = content:match('CURRENT_VERSION%s*=%s*["\']([^"\']+)["\']')
         if remoteVersion and isNewerVersion(remoteVersion, CURRENT_VERSION) then
           showUpdateAvailableDialog(remoteVersion, content)
+        else
+          if isManual then
+            showNoUpdateDialog()
+          end
+        end
+      else
+        if isManual then
+          mainHandler.post(Runnable{
+            run = function()
+              local builder = AlertDialog.Builder(service)
+                .setTitle("Pemeriksaan Gagal")
+                .setMessage("Gagal terhubung ke server pembaruan (Kode respons: " .. tostring(resCode) .. ").")
+                .setPositiveButton("Oke", function(dialog)
+                  dialog.dismiss()
+                end)
+              displayOverlayDialog(builder)
+              pcall(function() service.speak("Gagal memeriksa versi baru.") end)
+            end
+          })
         end
       end
-    end)
-  end
+    end
+  }).start()
 end
 
 -- ====================================================================
@@ -939,7 +1011,8 @@ showMainMenu = function()
     "4. Kualitas Resolusi Screenshot (Aktif: " .. currentResText .. ")",
     "5. Atur Instruksi Deskripsi Layar",
     "6. Atur Instruksi Deskripsi Video",
-    "7. Atur Instruksi Pindai Teks"
+    "7. Atur Instruksi Pindai Teks",
+    "8. Periksa Versi Baru"
   }
 
   local builder = AlertDialog.Builder(service)
@@ -960,6 +1033,8 @@ showMainMenu = function()
         showVideoInstructionDialog()
       elseif which == 6 then
         showTextInstructionDialog()
+      elseif which == 7 then
+        checkAppUpdate(true)
       end
     end)
     .setNegativeButton("Tutup", nil)
@@ -1164,7 +1239,7 @@ startScreenDescription()
 
 mainHandler.postDelayed(Runnable{
   run = function()
-    checkAppUpdate()
+    checkAppUpdate(false)
   end
 }, 1000)
 
