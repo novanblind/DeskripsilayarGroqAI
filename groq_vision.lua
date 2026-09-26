@@ -39,12 +39,12 @@ local mainHandler = Handler(Looper.getMainLooper())
 -- ====================================================================
 -- KONFIGURASI VERSI & GITHUB AUTO-UPDATE
 -- ====================================================================
-local CURRENT_VERSION = "2.0.6"
+local CURRENT_VERSION = "2.0.9"
 local GITHUB_RAW_URL = "https://raw.githubusercontent.com/novanblind/DeskripsilayarGroqAI/main/groq_vision.lua"
 
-local defaultApiKey = ""
+local defaultImageInstruction = [[DILARANG KERAS menggunakan kalimat pengantar, pembuka, atau basa-basi apa pun seperti 'Berdasarkan gambar...', 'Berikut adalah...', 'Gambar ini memperlihatkan...', atau sejenisnya. 
 
-local defaultImageInstruction = [[Deskripsikan gambar atau tampilan layar secara jelas, natural, dan profesional dalam bahasa Indonesia. Susun narasi visual yang mengalir dari elemen paling dominan ke objek, karakter, lingkungan, dan detail sekitarnya. Jelaskan warna, bentuk, ukuran, tekstur, posisi, pencahayaan, suasana, komposisi, serta hubungan antarelemen tanpa berlebihan atau mengarang informasi. Abaikan elemen antarmuka ponsel yang tidak relevan, seperti indikator sinyal, baterai, waktu, notifikasi, atau ikon sistem lainnya, kecuali jika secara khusus diminta untuk menjelaskannya.
+LANGSUNG mulai kata pertama dengan menyebutkan objek utama yang terlihat. Deskripsikan gambar atau tampilan layar secara jelas, natural, dan profesional dalam bahasa Indonesia. Susun narasi visual yang mengalir dari elemen paling dominan ke objek, karakter, lingkungan, dan detail sekitarnya. Jelaskan warna, bentuk, ukuran, tekstur, posisi, pencahayaan, suasana, komposisi, serta hubungan antarelemen tanpa berlebihan atau mengarang informasi. Abaikan elemen antarmuka ponsel yang tidak relevan, seperti indikator sinyal, baterai, waktu, notifikasi, atau ikon sistem lainnya, kecuali jika secara khusus diminta untuk menjelaskannya.
 
 Jika terdapat manusia atau karakter, gambarkan penampilan, pakaian, ekspresi, arah pandangan, gestur, dan kesan emosional yang tampak. Jelaskan pula kedalaman ruang, objek di depan, tengah, dan belakang, serta cara komposisi mengarahkan perhatian.
 
@@ -69,7 +69,7 @@ Tampilkan HANYA teks asli yang tertulis di layar persis apa adanya tanpa basa-ba
 local sp = service.getSharedPreferences("groq_vision_desc_config", Context.MODE_PRIVATE)
 
 -- ====================================================================
--- MANAJEMEN PENGATURAN & KUNCI API
+-- MANAJEMEN JALUR BERKAS SCRIPT LOKAL
 -- ====================================================================
 local function getScriptFilePath()
   local src = debug.getinfo(1, "S").source
@@ -127,32 +127,80 @@ local function readLocalApiKeyFile()
   return ""
 end
 
-local function getCustomApiKey()
-  local k = sp.getString("api_key", "")
-  if k ~= nil and k ~= "" then return k end
-  return ""
-end
+-- ====================================================================
+-- SISTEM MANAJEMEN MULTI KUNCI API (UTAMA & CADANGAN) — sama seperti
+-- skrip "Deskripsi kamera Groq by Novan": 1 kunci utama + 2 cadangan,
+-- dengan rotasi otomatis saat kunci aktif habis kuota/limit.
+-- ====================================================================
+local currentKeyIndex = 1
 
-local function getApiKey()
-  local customKey = getCustomApiKey()
-  if customKey ~= "" then return customKey end
+local function getAvailableApiKeys()
+  local list = {}
+  local seen = {}
 
-  local fileKey = readLocalApiKeyFile()
-  if fileKey ~= "" then return fileKey end
-
-  return defaultApiKey
-end
-
-local function setApiKey(k)
-  if k and k ~= "" then
-    sp.edit().putString("api_key", k).apply()
-  else
-    sp.edit().remove("api_key").apply()
+  -- Kunci Utama (cek kustom dulu, jika kosong baca api_key.txt)
+  local k1 = sp.getString("custom_api_key", "")
+  local k1Source = "Kustom"
+  if k1 == "" then
+    k1 = readLocalApiKeyFile()
+    k1Source = "api_key.txt"
   end
+  if k1 ~= "" then
+    table.insert(list, { key = k1, name = "Kunci Utama", source = k1Source })
+    seen[k1] = true
+  end
+
+  -- Kunci Cadangan 1
+  local k2 = sp.getString("backup_api_key_1", "")
+  if k2 ~= "" and not seen[k2] then
+    table.insert(list, { key = k2, name = "Kunci Cadangan 1", source = "Cadangan 1" })
+    seen[k2] = true
+  end
+
+  -- Kunci Cadangan 2
+  local k3 = sp.getString("backup_api_key_2", "")
+  if k3 ~= "" and not seen[k3] then
+    table.insert(list, { key = k3, name = "Kunci Cadangan 2", source = "Cadangan 2" })
+    seen[k3] = true
+  end
+
+  return list
 end
 
+local function getActiveKeyStatusLabel()
+  local keys = getAvailableApiKeys()
+  if #keys == 0 then return "Belum Diatur" end
+  local idx = currentKeyIndex
+  if idx > #keys then idx = 1 end
+  return keys[idx].name .. " Aktif (" .. #keys .. " kunci tersimpan)"
+end
+
+-- ====================================================================
+-- PENGATURAN LAINNYA
+-- ====================================================================
 local function getModelName() return sp.getString("model_name", "qwen/qwen3.8-27b") end
 local function setModelName(m) sp.edit().putString("model_name", m).apply() end
+
+-- Daftar model vision Groq yang diketahui bekerja dengan input gambar.
+-- Ditampilkan di menu "Ganti Model" agar pengguna tidak perlu mengetik
+-- manual, tapi opsi "Kustom" tetap disediakan untuk model lain.
+-- CATATAN: dari 11 model yang aktif di akun Groq pengguna saat ini
+-- (canopylabs/orpheus-arabic-saudi, canopylabs/orpheus-v1-english,
+-- openai/gpt-oss-20b, meta-llama/llama-prompt-guard-2-86m,
+-- qwen/qwen3.8-27b, whisper-large-v3, whisper-large-v3-turbo,
+-- allam-2-7b, openai/gpt-oss-120b, openai/gpt-oss-safeguard-20b,
+-- meta-llama/llama-prompt-guard-2-22m), HANYA qwen/qwen3.8-27b yang
+-- mendukung input gambar (image_url). Sisanya adalah model teks
+-- (gpt-oss, allam), suara/TTS (orpheus, whisper), atau guard/classifier
+-- (prompt-guard) — memilihnya di sini akan membuat permintaan gambar
+-- gagal dengan error 400. Jika akun mendapat akses model vision lain
+-- di kemudian hari, tambahkan ke daftar ini atau pakai opsi "Kustom".
+local knownVisionModels = {
+  "qwen/qwen3.8-27b"
+}
+
+local function getReasoningEffort() return sp.getString("reasoning_effort", "none") end
+local function setReasoningEffort(r) sp.edit().putString("reasoning_effort", r).apply() end
 
 local function getScanMode() return sp.getString("scan_feature_mode", "visual_desc") end
 local function setScanMode(m) sp.edit().putString("scan_feature_mode", m).apply() end
@@ -186,6 +234,7 @@ local chatHistory = {}
 local currentSysInstruction = defaultImageInstruction
 local showMainMenu
 local showApiKeyDialog
+local showModelDialog
 local startScreenDescription
 local showChatDialog
 local checkAppUpdate
@@ -365,8 +414,12 @@ end
 -- ====================================================================
 -- PENGOLAHAN GAMBAR (KOMPRESI & BASE64 DENGAN OPTIMASI RESOLUSI)
 -- ====================================================================
-local function bitmapToBase64(bitmap, isVideoMode)
-  local resMode = getResolutionMode()
+
+-- Menentukan batas sisi terpendek (limit) dan kualitas JPEG berdasarkan
+-- resolusi pilihan pengguna. isTextMode menaikkan batas minimum karena
+-- mode Pindai Teks butuh ketajaman lebih tinggi agar akurat, terlepas
+-- dari resolusi hemat-kuota yang mungkin dipilih untuk mode lain.
+local function resolveLimitQuality(resMode, isVideoMode, isTextMode)
   local targetQuality = 75
   local limit = 720
 
@@ -383,6 +436,50 @@ local function bitmapToBase64(bitmap, isVideoMode)
     limit = isVideoMode and 360 or 480
     targetQuality = isVideoMode and 65 or 70
   end
+
+  if isTextMode then
+    if limit ~= 0 then
+      limit = math.max(limit, 720)
+    end
+    targetQuality = math.max(targetQuality, 82)
+  end
+
+  return limit, targetQuality
+end
+
+local function getVideoFrameLimit()
+  local limit, _ = resolveLimitQuality(getResolutionMode(), true, false)
+  return limit
+end
+
+-- Downscale bitmap secara mandiri ke batas sisi terpendek tertentu.
+-- Dipakai untuk mengecilkan tiap frame video SEBELUM digabung, supaya
+-- kanvas gabungan tidak pernah berukuran resolusi layar penuh x 3
+-- (mencegah risiko OutOfMemoryError di perangkat RAM kecil).
+local function downscaleBitmapToLimit(bitmap, limit)
+  if not bitmap then return nil end
+  local w = bitmap.getWidth()
+  local h = bitmap.getHeight()
+  local minSide = math.min(w, h)
+  if limit <= 0 or minSide <= limit then
+    return bitmap
+  end
+  local scale = limit / minSide
+  local newW = math.max(1, math.floor(w * scale))
+  local newH = math.max(1, math.floor(h * scale))
+  local scaled = nil
+  pcall(function()
+    scaled = Bitmap.createScaledBitmap(bitmap, newW, newH, true)
+  end)
+  if scaled then
+    pcall(function() bitmap.recycle() end)
+    return scaled
+  end
+  return bitmap
+end
+
+local function bitmapToBase64(bitmap, isVideoMode, isTextMode)
+  local limit, targetQuality = resolveLimitQuality(getResolutionMode(), isVideoMode, isTextMode)
 
   local w = bitmap.getWidth()
   local h = bitmap.getHeight()
@@ -423,8 +520,15 @@ local function bitmapToBase64(bitmap, isVideoMode)
   return base64Str
 end
 
+-- Membungkus service.takeScreenshot(). PENTING: takeScreenshot() dapat
+-- melempar exception SECARA SINKRON (mis. kapabilitas screenshot belum
+-- diaktifkan di konfigurasi accessibility service, atau perangkat tidak
+-- mendukung). Sebelumnya exception ini ditelan diam-diam oleh pcall dan
+-- callback tidak pernah terpanggil, membuat aplikasi macet tanpa pesan
+-- apa pun. Sekarang exception ditangkap dan callback(false, ...) selalu
+-- dipanggil supaya pengguna mendapat pesan suara yang jelas.
 local function captureSingleFrame(callback)
-  pcall(function()
+  local ok, errMsg = pcall(function()
     service.takeScreenshot(Display.DEFAULT_DISPLAY, service.getMainExecutor(), TakeScreenshotCallback{
       onSuccess = function(screenshotResult)
         local bmp = nil
@@ -449,17 +553,29 @@ local function captureSingleFrame(callback)
       end
     })
   end)
+
+  if not ok then
+    callback(false, "Gagal memulai tangkapan layar (" .. tostring(errMsg) .. "). Pastikan izin tangkapan layar aksesibilitas sudah aktif.")
+  end
 end
 
 -- ====================================================================
--- GROQ API ASINKRON BEBAS KUNCI LUA
+-- GROQ API ASINKRON DENGAN DUKUNGAN KUNCI UTAMA & CADANGAN OTOMATIS
+-- (mekanisme rotasi kunci sama dengan skrip "Deskripsi kamera Groq")
 -- ====================================================================
+local REQUEST_TIMEOUT_MS = 15000
+
 local function sendGroqChat(userText, mediaData, onComplete)
-  local apiKey = getApiKey()
-  if apiKey == "" then
+  local keyList = getAvailableApiKeys()
+
+  if #keyList == 0 then
     onComplete(false, "Kunci API Groq belum ditemukan. Silakan atur di menu pengaturan.")
     showApiKeyDialog()
     return
+  end
+
+  if currentKeyIndex > #keyList then
+    currentKeyIndex = 1
   end
 
   if mediaData then
@@ -478,11 +594,43 @@ local function sendGroqChat(userText, mediaData, onComplete)
   end
 
   local activeModel = getModelName()
+  local scanMode = getScanMode()
+
+  -- Batas token disesuaikan dengan jenis permintaan: mode video harus
+  -- menceritakan 3 kondisi layar sekaligus, dan mode pindai teks bisa
+  -- berisi paragraf panjang, jadi keduanya butuh ruang lebih besar
+  -- daripada percakapan lanjutan (follow-up) biasa.
+  local maxTokens = 1200
+  if mediaData then
+    if scanMode == "video_desc" then
+      maxTokens = 3000
+    elseif scanMode == "text_ocr" then
+      maxTokens = 2500
+    else
+      maxTokens = 2000
+    end
+  end
 
   local jsonPayload = JSONObject()
   jsonPayload.put("model", activeModel)
   jsonPayload.put("temperature", 0.1)
-  jsonPayload.put("max_tokens", 800)
+  jsonPayload.put("max_tokens", maxTokens)
+
+  -- PENTING: model seri Qwen3 (mis. qwen/qwen3.8-27b, qwen/qwen3.6-27b)
+  -- berjalan dalam mode "thinking" dengan reasoning_effort maksimum
+  -- ("xhigh") SECARA DEFAULT jika parameter ini tidak dikirim. Tanpa
+  -- ini, token <think>...</think> bisa menghabiskan seluruh max_tokens
+  -- sebelum jawaban asli sempat ditulis, atau malah ikut terbaca oleh
+  -- service.speak(). Untuk kasus deskripsi/OCR yang butuh jawaban
+  -- langsung, mode instruct (reasoning_effort="none") lebih cocok.
+  -- reasoning_format="hidden" adalah jaring pengaman tambahan agar
+  -- konten reasoning tidak pernah ikut ke field "content" walau pada
+  -- model/parameter lain yang mungkin tetap mengembalikannya.
+  local reasoningEffort = getReasoningEffort()
+  if reasoningEffort and reasoningEffort ~= "" and reasoningEffort ~= "default" then
+    jsonPayload.put("reasoning_effort", reasoningEffort)
+  end
+  jsonPayload.put("reasoning_format", "hidden")
 
   local messagesArray = JSONArray()
   if currentSysInstruction and currentSysInstruction ~= "" then
@@ -520,126 +668,234 @@ local function sendGroqChat(userText, mediaData, onComplete)
   local payloadStr = jsonPayload.toString()
   local endpoint = "https://api.groq.com/openai/v1/chat/completions"
 
-  local headerMap = HashMap()
-  headerMap.put("Content-Type", "application/json; charset=UTF-8")
-  headerMap.put("Authorization", "Bearer " .. apiKey)
+  local keysTriedCount = 0
+  local totalKeys = #keyList
 
-  local maxRetries = 3
-  local attempt = 0
-
-  local function executeRequest()
-    attempt = attempt + 1
-
-    local function handleResult(code, content)
-      mainHandler.post(Runnable{
-        run = function()
-          if code == 200 and content and #content > 0 then
-            local ok, parseErr = pcall(function()
-              local resObj = JSONObject(content)
-              local choices = resObj.optJSONArray("choices")
-              if choices and choices.length() > 0 then
-                local choiceMsg = choices.getJSONObject(0).optJSONObject("message")
-                if choiceMsg then
-                  local text = choiceMsg.optString("content")
-                  table.insert(chatHistory, { role = "assistant", content = text })
-                  onComplete(true, text)
-                  return
-                end
-              end
-              error("Respon server kosong")
-            end)
-            if ok then return end
-          end
-
-          if attempt < maxRetries then
-            mainHandler.postDelayed(Runnable{
-              run = function()
-                executeRequest()
-              end
-            }, 1500)
-          else
-            local errMsg = "Gagal memproses permintaan setelah " .. attempt .. "x percobaan."
-            if content then
-              pcall(function()
-                local errObj = JSONObject(content).optJSONObject("error")
-                if errObj then
-                  errMsg = errObj.optString("message") .. " (" .. attempt .. "x gagal)"
-                end
-              end)
-            end
-            onComplete(false, errMsg)
-          end
-        end
-      })
-    end
-
-    local httpEngine = http or Http
-    local dispatched = false
-
-    if httpEngine and httpEngine.post then
-      local ok = pcall(function()
-        httpEngine.post(endpoint, payloadStr, headerMap, function(code, content)
-          handleResult(code, content)
-        end)
-      end)
-      if ok then
-        dispatched = true
-      else
-        ok = pcall(function()
-          httpEngine.post(endpoint, payloadStr, "", "UTF-8", headerMap, function(code, content)
-            handleResult(code, content)
-          end)
-        end)
-        if ok then dispatched = true end
-      end
-    end
-
-    if not dispatched then
-      Thread(Runnable{
-        run = function()
-          local postData = String(payloadStr).getBytes("UTF-8")
-          local resCode = 0
-          local resContent = nil
-          pcall(function()
-            local url = URL(endpoint)
-            local conn = url.openConnection()
-            conn.setRequestMethod("POST")
-            conn.setInstanceFollowRedirects(false)
-            conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8")
-            conn.setRequestProperty("Authorization", "Bearer " .. apiKey)
-            conn.setDoOutput(true)
-            conn.setDoInput(true)
-            conn.setConnectTimeout(12000)
-            conn.setReadTimeout(25000)
-
-            local os = conn.getOutputStream()
-            os.write(postData)
-            os.flush()
-            os.close()
-
-            resCode = conn.getResponseCode()
-            local stream = (resCode == 200) and conn.getInputStream() or conn.getErrorStream()
-            if stream then
-              local reader = BufferedReader(InputStreamReader(stream, "UTF-8"))
-              local lines = {}
-              local line = reader.readLine()
-              while line ~= nil do
-                table.insert(lines, line)
-                line = reader.readLine()
-              end
-              reader.close()
-              resContent = table.concat(lines, "\n")
-            end
-            conn.disconnect()
-          end)
-
-          handleResult(resCode, resContent)
-        end
-      }).start()
+  -- Jika seluruh kunci akhirnya gagal, buang pesan pengguna yang sudah
+  -- terlanjur dimasukkan ke riwayat supaya percakapan tidak menyimpan
+  -- pertanyaan tanpa jawaban.
+  local function dropPendingUserMessage()
+    if #chatHistory > 0 and chatHistory[#chatHistory].role == "user" then
+      table.remove(chatHistory, #chatHistory)
     end
   end
 
-  executeRequest()
+  local function executeWithKey()
+    local currentItem = keyList[currentKeyIndex]
+    local activeKey = currentItem.key
+    local keyLabel = currentItem.name
+
+    local headerMap = HashMap()
+    headerMap.put("Content-Type", "application/json; charset=UTF-8")
+    headerMap.put("Authorization", "Bearer " .. activeKey)
+
+    local maxRetries = 2
+    local attempt = 0
+
+    local function switchToNextKey(reasonText)
+      keysTriedCount = keysTriedCount + 1
+      if keysTriedCount < totalKeys then
+        currentKeyIndex = (currentKeyIndex % totalKeys) + 1
+        local nextItem = keyList[currentKeyIndex]
+        service.speak(reasonText .. " Beralih ke " .. nextItem.name .. "...")
+        mainHandler.postDelayed(Runnable{
+          run = function()
+            executeWithKey()
+          end
+        }, 500)
+      else
+        dropPendingUserMessage()
+        onComplete(false, "Semua kunci API (" .. totalKeys .. " kunci) telah mencapai limit token/kuota atau gagal diproses.")
+      end
+    end
+
+    local function executeRequest()
+      attempt = attempt + 1
+
+      -- Penanda agar hasil (baik dari respon asli maupun dari watchdog
+      -- timeout 15 detik) hanya diproses SATU KALI. Ini mencegah pesan
+      -- ganda / logika ganda jika respon lambat tetap datang setelah
+      -- timeout sudah dianggap gagal.
+      local requestSettled = false
+
+      local function handleResult(code, content)
+        if requestSettled then return end
+        requestSettled = true
+
+        mainHandler.post(Runnable{
+          run = function()
+            -- 1. Respon Sukses (HTTP 200)
+            if code == 200 and content and #content > 0 then
+              local ok = pcall(function()
+                local resObj = JSONObject(content)
+                local choices = resObj.optJSONArray("choices")
+                if choices and choices.length() > 0 then
+                  local choiceMsg = choices.getJSONObject(0).optJSONObject("message")
+                  if choiceMsg then
+                    local text = choiceMsg.optString("content")
+                    table.insert(chatHistory, { role = "assistant", content = text })
+                    onComplete(true, text)
+                    return
+                  end
+                end
+                error("Respon server kosong")
+              end)
+              if ok then return end
+            end
+
+            -- 1b. Ditandai timeout oleh watchdog 15 detik
+            if code == -1 then
+              switchToNextKey("Waktu tunggu " .. keyLabel .. " habis (lebih dari 15 detik tanpa respons).")
+              return
+            end
+
+            -- 2. Permintaan tidak valid (400) — bukan masalah kuota, jadi
+            -- jangan diperlakukan sebagai limit dan jangan diputar ke
+            -- kunci lain (kunci lain akan gagal dengan alasan yang sama).
+            if code == 400 then
+              dropPendingUserMessage()
+              local reason = "Permintaan ditolak oleh server (kode 400)."
+              pcall(function()
+                if content and content ~= "" then
+                  local errObj = JSONObject(content).optJSONObject("error")
+                  if errObj then
+                    local msg = errObj.optString("message")
+                    if msg and msg ~= "" then
+                      reason = "Permintaan ditolak: " .. msg
+                    end
+                  end
+                end
+              end)
+              onComplete(false, reason)
+              return
+            end
+
+            -- 3. Deteksi Limit Token / Kuota Habis (429, 402, 401, atau
+            -- pesan JSON spesifik — kata kunci sengaja tidak terlalu umum
+            -- supaya tidak salah menganggap error lain sebagai limit).
+            local isLimit = false
+            if code == 429 or code == 402 or code == 401 then
+              isLimit = true
+            elseif content and content ~= "" then
+              local lc = string.lower(tostring(content))
+              if lc:find("rate_limit")
+                or lc:find("rate limit")
+                or lc:find("quota")
+                or lc:find("insufficient_quota")
+                or lc:find("resource_exhausted")
+                or lc:find("exceeded your current quota")
+                or lc:find("tokens per minute")
+                or lc:find("requests per minute") then
+                isLimit = true
+              end
+            end
+
+            if isLimit then
+              switchToNextKey("Token/kuota pada " .. keyLabel .. " telah habis atau limit.")
+              return
+            end
+
+            -- 4. Error Jaringan Sementara (Retry sebelum pindah kunci)
+            if attempt < maxRetries then
+              requestSettled = false
+              mainHandler.postDelayed(Runnable{
+                run = function()
+                  executeRequest()
+                end
+              }, 1500)
+            else
+              switchToNextKey("Koneksi gagal pada " .. keyLabel .. ".")
+            end
+          end
+        })
+      end
+
+      -- ====================================================================
+      -- WATCHDOG TIMEOUT 15 DETIK
+      -- Jika dalam 15 detik belum ada respons sama sekali (baik lewat
+      -- httpEngine.post maupun koneksi manual java.net), anggap permintaan
+      -- ini gagal (kode -1) dan lanjut ke logika penanganan biasa
+      -- (retry / pindah kunci cadangan) alih-alih diam menunggu selamanya.
+      -- Mekanisme ini disamakan dengan skrip "Deskripsi kamera Groq".
+      -- ====================================================================
+      mainHandler.postDelayed(Runnable{
+        run = function()
+          handleResult(-1, nil)
+        end
+      }, REQUEST_TIMEOUT_MS)
+
+      local httpEngine = http or Http
+      local dispatched = false
+
+      if httpEngine and httpEngine.post then
+        local ok = pcall(function()
+          httpEngine.post(endpoint, payloadStr, headerMap, function(code, content)
+            handleResult(code, content)
+          end)
+        end)
+        if ok then
+          dispatched = true
+        else
+          ok = pcall(function()
+            httpEngine.post(endpoint, payloadStr, "", "UTF-8", headerMap, function(code, content)
+              handleResult(code, content)
+            end)
+          end)
+          if ok then dispatched = true end
+        end
+      end
+
+      if not dispatched then
+        Thread(Runnable{
+          run = function()
+            local postData = String(payloadStr).getBytes("UTF-8")
+            local resCode = 0
+            local resContent = nil
+            pcall(function()
+              local url = URL(endpoint)
+              local conn = url.openConnection()
+              conn.setRequestMethod("POST")
+              conn.setInstanceFollowRedirects(false)
+              conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8")
+              conn.setRequestProperty("Authorization", "Bearer " .. activeKey)
+              conn.setDoOutput(true)
+              conn.setDoInput(true)
+              -- Batas koneksi & baca disesuaikan agar total tetap berada
+              -- di sekitar batas watchdog 15 detik di atas.
+              conn.setConnectTimeout(5000)
+              conn.setReadTimeout(10000)
+
+              local outStream = conn.getOutputStream()
+              outStream.write(postData)
+              outStream.flush()
+              outStream.close()
+
+              resCode = conn.getResponseCode()
+              local stream = (resCode == 200) and conn.getInputStream() or conn.getErrorStream()
+              if stream then
+                local reader = BufferedReader(InputStreamReader(stream, "UTF-8"))
+                local lines = {}
+                local line = reader.readLine()
+                while line ~= nil do
+                  table.insert(lines, line)
+                  line = reader.readLine()
+                end
+                reader.close()
+                resContent = table.concat(lines, "\n")
+              end
+              conn.disconnect()
+            end)
+
+            handleResult(resCode, resContent)
+          end
+        }).start()
+      end
+    end
+
+    executeRequest()
+  end
+
+  executeWithKey()
 end
 
 -- ====================================================================
@@ -760,40 +1016,180 @@ showChatDialog = function()
   end)
 end
 
-showApiKeyDialog = function()
-  local customKey = getCustomApiKey()
+local function showSingleKeyEditDialog(title, prefKey, currentValue, isPrimary)
   local input = EditText(service)
-  input.setText(customKey ~= "" and customKey or "")
-
-  local defaultExists = (readLocalApiKeyFile() ~= "" or defaultApiKey ~= "")
-  if defaultExists and customKey == "" then
-    input.setHint("Kunci bawaan aktif. Tempel kunci baru jika ingin mengganti...")
-  else
-    input.setHint("Tempel Kunci API Groq (gsk_...) di sini...")
-  end
   input.setSingleLine(true)
 
+  if currentValue ~= "" then
+    input.setText(currentValue)
+    input.setHint("Kunci aktif tersimpan")
+  else
+    input.setText("")
+    input.setHint(isPrimary and "Tempel kunci API utama di sini..." or "Tempel kunci API cadangan di sini...")
+  end
+
   local builder = AlertDialog.Builder(service)
-    .setTitle("Atur Kunci API Groq")
+    .setTitle(title)
     .setView(input)
     .setPositiveButton("Simpan", function()
       local key = tostring(input.getText()):gsub("^%s*(.-)%s*$", "%1")
       if key ~= "" then
-        setApiKey(key)
-        service.speak("Kunci API kustom berhasil disimpan.")
+        sp.edit().putString(prefKey, key).apply()
+        currentKeyIndex = 1
+        service.speak(title .. " berhasil disimpan.")
       else
-        setApiKey("")
-        service.speak("Kunci kustom dihapus, kembali ke kunci bawaan.")
+        sp.edit().remove(prefKey).apply()
+        currentKeyIndex = 1
+        service.speak(title .. " dikosongkan.")
       end
     end)
-    .setNeutralButton("Reset Bawaan", function()
-      setApiKey("")
-      local defaultKey = readLocalApiKeyFile()
-      if defaultKey ~= "" or defaultApiKey ~= "" then
-        service.speak("Kunci API dikembalikan ke setelan bawaan.")
-      else
-        service.speak("Kunci API di-reset. Pastikan file api_key.txt terisi kunci bawaan.")
+    .setNeutralButton("Hapus Kunci", function()
+      sp.edit().remove(prefKey).apply()
+      currentKeyIndex = 1
+      service.speak(title .. " dihapus.")
+    end)
+    .setNegativeButton("Batal", nil)
+
+  displayOverlayDialog(builder)
+end
+
+showApiKeyDialog = function()
+  local k1 = sp.getString("custom_api_key", "")
+  local k2 = sp.getString("backup_api_key_1", "")
+  local k3 = sp.getString("backup_api_key_2", "")
+  local localKey = readLocalApiKeyFile()
+
+  local s1 = (k1 ~= "") and "Kustom Tersimpan" or (localKey ~= "" and "Dari api_key.txt" or "Belum Diatur")
+  local s2 = (k2 ~= "") and "Tersimpan" or "Kosong"
+  local s3 = (k3 ~= "") and "Tersimpan" or "Kosong"
+
+  local allKeys = getAvailableApiKeys()
+  local activeKeyName = (allKeys[currentKeyIndex] and allKeys[currentKeyIndex].name) or "Belum ada kunci"
+
+  local items = {
+    "1. Kunci API Utama (" .. s1 .. ")",
+    "2. Kunci Cadangan 1 (" .. s2 .. ")",
+    "3. Kunci Cadangan 2 (" .. s3 .. ")",
+    "4. Kembalikan Posisi ke Kunci Utama (Aktif: " .. activeKeyName .. ")",
+    "5. Reset / Hapus Seluruh Kunci API"
+  }
+
+  local builder = AlertDialog.Builder(service)
+    .setTitle("Pengaturan Kunci API (Utama & Cadangan)")
+    .setItems(items, function(dialog, which)
+      dialog.dismiss()
+      if which == 0 then
+        showSingleKeyEditDialog("Kunci API Utama", "custom_api_key", k1, true)
+      elseif which == 1 then
+        showSingleKeyEditDialog("Kunci Cadangan 1", "backup_api_key_1", k2, false)
+      elseif which == 2 then
+        showSingleKeyEditDialog("Kunci Cadangan 2", "backup_api_key_2", k3, false)
+      elseif which == 3 then
+        currentKeyIndex = 1
+        service.speak("Indeks kunci aktif dikembalikan ke Kunci Utama.")
+      elseif which == 4 then
+        sp.edit().remove("custom_api_key").remove("backup_api_key_1").remove("backup_api_key_2").apply()
+        currentKeyIndex = 1
+        if readLocalApiKeyFile() ~= "" then
+          service.speak("Kunci kustom dan cadangan dihapus. Kembali ke file api_key.txt bawaan.")
+        else
+          service.speak("Semua kunci API berhasil dihapus.")
+        end
       end
+    end)
+    .setNegativeButton("Tutup", nil)
+
+  displayOverlayDialog(builder)
+end
+
+-- Dialog untuk mengetik nama model secara manual (dipakai oleh opsi
+-- "Kustom" di showModelDialog).
+local function showCustomModelInputDialog()
+  local input = EditText(service)
+  input.setSingleLine(true)
+  input.setText(getModelName())
+  input.setHint("Contoh: qwen/qwen3.8-27b")
+
+  local builder = AlertDialog.Builder(service)
+    .setTitle("Model Kustom (Manual)")
+    .setView(input)
+    .setPositiveButton("Simpan", function()
+      local m = tostring(input.getText()):gsub("^%s*(.-)%s*$", "%1")
+      if m ~= "" then
+        setModelName(m)
+        service.speak("Model diatur ke " .. m)
+      end
+    end)
+    .setNegativeButton("Batal", nil)
+
+  displayOverlayDialog(builder)
+end
+
+-- Dialog pemilihan model & mode reasoning. Sebelumnya getModelName()/
+-- setModelName() sudah ada tapi tidak pernah dipakai oleh menu manapun,
+-- sehingga pengguna tidak bisa mengganti model dari UI. Dialog ini
+-- menutup celah tersebut.
+showModelDialog = function()
+  local currentModel = getModelName()
+  local options = {}
+  local selectedIndex = #knownVisionModels -- default ke "Kustom" jika tidak cocok
+  for i, m in ipairs(knownVisionModels) do
+    table.insert(options, m)
+    if m == currentModel then
+      selectedIndex = i - 1
+    end
+  end
+  table.insert(options, "Kustom (ketik manual)...")
+  if currentModel ~= "" then
+    local found = false
+    for _, m in ipairs(knownVisionModels) do
+      if m == currentModel then found = true end
+    end
+    if not found then
+      selectedIndex = #options - 1
+    end
+  end
+
+  local builder = AlertDialog.Builder(service)
+    .setTitle("Pilih Model Groq (Aktif: " .. currentModel .. ")")
+    .setSingleChoiceItems(options, selectedIndex, function(dialog, which)
+      dialog.dismiss()
+      if which == #options - 1 then
+        showCustomModelInputDialog()
+      else
+        local chosen = knownVisionModels[which + 1]
+        setModelName(chosen)
+        service.speak("Model diatur ke " .. chosen)
+      end
+    end)
+    .setNegativeButton("Batal", nil)
+
+  displayOverlayDialog(builder)
+end
+
+local function showReasoningEffortDialog()
+  local effortOptions = {
+    "Instruct - Cepat & Langsung Jawab (Bawaan, disarankan)",
+    "Rendah (low)",
+    "Sedang (medium)",
+    "Tinggi (high)",
+    "Maksimum (xhigh) - Paling Lambat & Boros Token"
+  }
+  local effortValues = { "none", "low", "medium", "high", "xhigh" }
+
+  local curEffort = getReasoningEffort()
+  local selectedIndex = 0
+  for i, v in ipairs(effortValues) do
+    if v == curEffort then selectedIndex = i - 1 end
+  end
+
+  local builder = AlertDialog.Builder(service)
+    .setTitle("Mode Reasoning Model")
+    .setSingleChoiceItems(effortOptions, selectedIndex, function(dialog, which)
+      dialog.dismiss()
+      local chosen = effortValues[which + 1]
+      setReasoningEffort(chosen)
+      service.speak("Mode reasoning diatur ke " .. effortOptions[which + 1])
     end)
     .setNegativeButton("Batal", nil)
 
@@ -902,7 +1298,7 @@ local function showResolutionDialog()
         service.speak("Resolusi Sedang 720p diaktifkan.")
       elseif which == 3 then
         setResolutionMode("480")
-        service.speak("Resolusi Rendah 480p diaktifkan.")
+        service.speak("Resolusi Rendah 480p diaktifkan. Catatan: mode Pindai Teks tetap memakai ketajaman minimum setara 720p agar akurat.")
       end
     end)
     .setNegativeButton("Batal", nil)
@@ -980,13 +1376,7 @@ local function showTextInstructionDialog()
 end
 
 showMainMenu = function()
-  local customKey = getCustomApiKey()
-  local currentKeyStatus = "Belum Diatur"
-  if customKey ~= "" then
-    currentKeyStatus = "Kustom Terpasang"
-  elseif getApiKey() ~= "" then
-    currentKeyStatus = "Bawaan Aktif"
-  end
+  local currentKeyStatus = getActiveKeyStatusLabel()
 
   local modeLabels = {
     ["visual_desc"] = "Deskripsi Layar",
@@ -1003,16 +1393,27 @@ showMainMenu = function()
     ["480"] = "480p"
   }
   local currentResText = resLabels[getResolutionMode()] or "720p"
+  local currentModelText = getModelName()
+  local effortLabels = {
+    ["none"] = "Instruct (cepat)",
+    ["low"] = "Rendah",
+    ["medium"] = "Sedang",
+    ["high"] = "Tinggi",
+    ["xhigh"] = "Maksimum"
+  }
+  local currentEffortText = effortLabels[getReasoningEffort()] or "Instruct (cepat)"
 
   local menuItems = {
-    "1. Atur Kunci API Groq (" .. currentKeyStatus .. ")",
-    "2. Mode Pemindaian (Aktif: " .. currentModeText .. ")",
-    "3. Durasi Perekaman Video (Aktif: " .. currentDurText .. ")",
-    "4. Kualitas Resolusi Screenshot (Aktif: " .. currentResText .. ")",
-    "5. Atur Instruksi Deskripsi Layar",
-    "6. Atur Instruksi Deskripsi Video",
-    "7. Atur Instruksi Pindai Teks",
-    "8. Periksa Versi Baru"
+    "1. Atur Kunci API Groq (Utama & Cadangan) (" .. currentKeyStatus .. ")",
+    "2. Ganti Model Groq (Aktif: " .. currentModelText .. ")",
+    "3. Mode Reasoning Model (Aktif: " .. currentEffortText .. ")",
+    "4. Mode Pemindaian (Aktif: " .. currentModeText .. ")",
+    "5. Durasi Perekaman Video (Aktif: " .. currentDurText .. ")",
+    "6. Kualitas Resolusi Screenshot (Aktif: " .. currentResText .. ")",
+    "7. Atur Instruksi Deskripsi Layar",
+    "8. Atur Instruksi Deskripsi Video",
+    "9. Atur Instruksi Pindai Teks",
+    "10. Periksa Versi Baru"
   }
 
   local builder = AlertDialog.Builder(service)
@@ -1022,18 +1423,22 @@ showMainMenu = function()
       if which == 0 then
         showApiKeyDialog()
       elseif which == 1 then
-        showScanModeDialog()
+        showModelDialog()
       elseif which == 2 then
-        showVideoDurationDialog()
+        showReasoningEffortDialog()
       elseif which == 3 then
-        showResolutionDialog()
+        showScanModeDialog()
       elseif which == 4 then
-        showImageInstructionDialog()
+        showVideoDurationDialog()
       elseif which == 5 then
-        showVideoInstructionDialog()
+        showResolutionDialog()
       elseif which == 6 then
-        showTextInstructionDialog()
+        showImageInstructionDialog()
       elseif which == 7 then
+        showVideoInstructionDialog()
+      elseif which == 8 then
+        showTextInstructionDialog()
+      elseif which == 9 then
         checkAppUpdate(true)
       end
     end)
@@ -1043,7 +1448,7 @@ showMainMenu = function()
 end
 
 startScreenDescription = function()
-  if getApiKey() == "" then
+  if #getAvailableApiKeys() == 0 then
     service.speak("Kunci API Groq belum ditemukan. Silakan atur kunci API atau buat file api_key.txt.")
     showApiKeyDialog()
     return
@@ -1067,18 +1472,23 @@ startScreenDescription = function()
     service.speak("Merekam video selama " .. tostring(dur) .. " detik...")
 
     local frames = {}
+    local frameLimit = getVideoFrameLimit()
 
     -- Ambil Frame 1: Awal Pemutaran (Panel Atas)
     mainHandler.postDelayed(Runnable{
       run = function()
         captureSingleFrame(function(ok1, bmp1)
           if not ok1 or not bmp1 then
-            local err = "Gagal mengambil frame awal video."
+            local err = type(bmp1) == "string" and bmp1 or "Gagal mengambil frame awal video."
             chatHistory = { {role = "assistant", content = err} }
             service.speak(err)
             showChatDialog()
             return
           end
+          -- Kecilkan frame SEGERA setelah ditangkap, sebelum digabung,
+          -- supaya kanvas gabungan tidak pernah berukuran resolusi
+          -- layar penuh x 3 (mencegah risiko kehabisan memori).
+          bmp1 = downscaleBitmapToLimit(bmp1, frameLimit)
           table.insert(frames, bmp1)
 
           -- Ambil Frame 2: Pertengahan Pemutaran (Panel Tengah)
@@ -1086,12 +1496,13 @@ startScreenDescription = function()
             run = function()
               captureSingleFrame(function(ok2, bmp2)
                 if not ok2 or not bmp2 then
-                  local err = "Gagal mengambil frame tengah video."
+                  local err = type(bmp2) == "string" and bmp2 or "Gagal mengambil frame tengah video."
                   chatHistory = { {role = "assistant", content = err} }
                   service.speak(err)
                   showChatDialog()
                   return
                 end
+                bmp2 = downscaleBitmapToLimit(bmp2, frameLimit)
                 table.insert(frames, bmp2)
 
                 -- Ambil Frame 3: Akhir Pemutaran (Panel Bawah)
@@ -1099,13 +1510,31 @@ startScreenDescription = function()
                   run = function()
                     captureSingleFrame(function(ok3, bmp3)
                       if not ok3 or not bmp3 then
-                        local err = "Gagal mengambil frame akhir video."
+                        local err = type(bmp3) == "string" and bmp3 or "Gagal mengambil frame akhir video."
                         chatHistory = { {role = "assistant", content = err} }
                         service.speak(err)
                         showChatDialog()
                         return
                       end
+                      bmp3 = downscaleBitmapToLimit(bmp3, frameLimit)
                       table.insert(frames, bmp3)
+
+                      -- Jaga-jaga: jika orientasi/ukuran layar berubah di
+                      -- tengah perekaman, lebar antar-frame bisa berbeda
+                      -- dan akan merusak susunan kanvas gabungan. Batalkan
+                      -- dengan pesan yang jelas alih-alih menghasilkan
+                      -- gambar gabungan yang salah tanpa peringatan.
+                      if frames[1].getWidth() ~= frames[2].getWidth()
+                        or frames[1].getWidth() ~= frames[3].getWidth() then
+                        pcall(function() frames[1].recycle() end)
+                        pcall(function() frames[2].recycle() end)
+                        pcall(function() frames[3].recycle() end)
+                        local errDim = "Ukuran layar berubah saat perekaman video. Coba lagi tanpa memutar layar."
+                        chatHistory = { {role = "assistant", content = errDim} }
+                        service.speak(errDim)
+                        showChatDialog()
+                        return
+                      end
 
                       service.speak("Menganalisis video dengan Groq...")
 
@@ -1129,7 +1558,7 @@ startScreenDescription = function()
                             pcall(function() frames[2].recycle() end)
                             pcall(function() frames[3].recycle() end)
 
-                            base64Screen = bitmapToBase64(stitched, true)
+                            base64Screen = bitmapToBase64(stitched, true, false)
                           end)
 
                           mainHandler.post(Runnable{
@@ -1181,7 +1610,7 @@ startScreenDescription = function()
     run = function()
       captureSingleFrame(function(ok, bitmap)
         if not ok or not bitmap then
-          local errShot = bitmap or "Gagal mengambil tangkapan layar."
+          local errShot = (type(bitmap) == "string" and bitmap) or "Gagal mengambil tangkapan layar."
           chatHistory = { {role = "assistant", content = errShot} }
           service.speak(errShot)
           showChatDialog()
@@ -1190,7 +1619,7 @@ startScreenDescription = function()
 
         Thread(Runnable{
           run = function()
-            local base64Screen = bitmapToBase64(bitmap, false)
+            local base64Screen = bitmapToBase64(bitmap, false, isTextMode)
             mainHandler.post(Runnable{
               run = function()
                 if base64Screen then
