@@ -563,7 +563,12 @@ end
 -- GROQ API ASINKRON DENGAN DUKUNGAN KUNCI UTAMA & CADANGAN OTOMATIS
 -- (mekanisme rotasi kunci sama dengan skrip "Deskripsi kamera Groq")
 -- ====================================================================
-local REQUEST_TIMEOUT_MS = 15000
+-- Batas waktu tunggu dasar (mode foto/teks biasa). Mode Deskripsi Video
+-- memakai batas lebih longgar (lihat requestTimeoutMs di bawah) karena
+-- payload gambar gabungan 3 frame + max_tokens yang lebih besar (3000)
+-- wajar butuh waktu proses lebih lama dari satu foto biasa.
+local REQUEST_TIMEOUT_MS = 20000
+local REQUEST_TIMEOUT_MS_VIDEO = 30000
 
 local function sendGroqChat(userText, mediaData, onComplete)
   local keyList = getAvailableApiKeys()
@@ -596,18 +601,33 @@ local function sendGroqChat(userText, mediaData, onComplete)
   local activeModel = getModelName()
   local scanMode = getScanMode()
 
-  -- Batas token disesuaikan dengan jenis permintaan: mode video harus
-  -- menceritakan 3 kondisi layar sekaligus, dan mode pindai teks bisa
-  -- berisi paragraf panjang, jadi keduanya butuh ruang lebih besar
-  -- daripada percakapan lanjutan (follow-up) biasa.
-  local maxTokens = 1200
+  -- ==================================================================
+  -- PENTING — BATAS OTPM (Output Tokens Per Minute) GROQ:
+  -- Tier gratis/on-demand Groq untuk model qwen/qwen3.8-27b membatasi
+  -- output ke ~1000 token PER MENIT PER REQUEST (bukan akumulasi harian).
+  -- Kalau max_tokens yang diminta melebihi batas ini, Groq langsung
+  -- menolak SATU request itu dengan error 429 "Request too large"
+  -- sebelum sempat memproses apa pun — ini terjadi setiap saat, tidak
+  -- peduli sudah berapa lama tidak dipakai, dan tidak terpengaruh oleh
+  -- jumlah kunci cadangan (kalau semua akun memakai tier yang sama,
+  -- semuanya kena batas yang sama juga). Nilai di bawah sengaja dijaga
+  -- di bawah 1000 dengan sedikit buffer supaya tidak mepet ke limit.
+  -- Konsekuensinya: mode Pindai Teks & Deskripsi Video yang tadinya
+  -- diberi jatah token lebih besar untuk hasil panjang, sekarang ikut
+  -- dibatasi juga — hasil untuk teks/video sangat panjang bisa terpotong.
+  -- Kalau butuh output lebih panjang, satu-satunya cara adalah upgrade
+  -- ke Dev Tier di https://console.groq.com/settings/billing.
+  -- ==================================================================
+  local MAX_OUTPUT_TOKENS_CAP = 900
+
+  local maxTokens = MAX_OUTPUT_TOKENS_CAP
   if mediaData then
     if scanMode == "video_desc" then
-      maxTokens = 3000
+      maxTokens = MAX_OUTPUT_TOKENS_CAP
     elseif scanMode == "text_ocr" then
-      maxTokens = 2500
+      maxTokens = MAX_OUTPUT_TOKENS_CAP
     else
-      maxTokens = 2000
+      maxTokens = MAX_OUTPUT_TOKENS_CAP
     end
   end
 
@@ -668,6 +688,12 @@ local function sendGroqChat(userText, mediaData, onComplete)
   local payloadStr = jsonPayload.toString()
   local endpoint = "https://api.groq.com/openai/v1/chat/completions"
 
+  -- Mode video mengirim gambar gabungan 3 frame (lebih besar) dan minta
+  -- max_tokens lebih besar (3000), jadi diberi jatah waktu tunggu lebih
+  -- panjang daripada mode foto/teks biasa agar tidak salah dianggap
+  -- "gagal" padahal Groq masih memproses secara wajar.
+  local requestTimeoutMs = (scanMode == "video_desc") and REQUEST_TIMEOUT_MS_VIDEO or REQUEST_TIMEOUT_MS
+
   local keysTriedCount = 0
   local totalKeys = #keyList
 
@@ -692,7 +718,15 @@ local function sendGroqChat(userText, mediaData, onComplete)
     local maxRetries = 2
     local attempt = 0
 
+    -- Menyimpan alasan kegagalan TERAKHIR (apa adanya, bukan digeneralisir)
+    -- supaya kalau semua kunci habis dicoba, pesan akhir ke pengguna tetap
+    -- menyebutkan penyebab sebenarnya (timeout / rate-limit / key ditolak /
+    -- koneksi gagal) alih-alih selalu bilang "limit token/kuota" walau yang
+    -- terjadi sebenarnya cuma request yang lambat.
+    local lastFailReason = "Penyebab tidak diketahui"
+
     local function switchToNextKey(reasonText)
+      lastFailReason = reasonText
       keysTriedCount = keysTriedCount + 1
       if keysTriedCount < totalKeys then
         currentKeyIndex = (currentKeyIndex % totalKeys) + 1
@@ -705,7 +739,7 @@ local function sendGroqChat(userText, mediaData, onComplete)
         }, 500)
       else
         dropPendingUserMessage()
-        onComplete(false, "Semua kunci API (" .. totalKeys .. " kunci) telah mencapai limit token/kuota atau gagal diproses.")
+        onComplete(false, "Semua kunci API (" .. totalKeys .. " kunci) gagal diproses. Penyebab terakhir: " .. lastFailReason)
       end
     end
 
@@ -743,9 +777,11 @@ local function sendGroqChat(userText, mediaData, onComplete)
               if ok then return end
             end
 
-            -- 1b. Ditandai timeout oleh watchdog 15 detik
+            -- 1b. Ditandai timeout oleh watchdog (BUKAN berarti kuota habis,
+            -- hanya berarti belum ada balasan dalam batas waktu yang
+            -- ditentukan — bisa jadi Groq/jaringan sedang lambat).
             if code == -1 then
-              switchToNextKey("Waktu tunggu " .. keyLabel .. " habis (lebih dari 15 detik tanpa respons).")
+              switchToNextKey("Waktu tunggu " .. keyLabel .. " habis (lebih dari " .. math.floor(requestTimeoutMs / 1000) .. " detik tanpa respons, BUKAN limit kuota).")
               return
             end
 
@@ -770,12 +806,22 @@ local function sendGroqChat(userText, mediaData, onComplete)
               return
             end
 
-            -- 3. Deteksi Limit Token / Kuota Habis (429, 402, 401, atau
-            -- pesan JSON spesifik — kata kunci sengaja tidak terlalu umum
-            -- supaya tidak salah menganggap error lain sebagai limit).
+            -- 3. Deteksi Limit Token / Kuota Habis vs Kunci Ditolak.
+            -- Kode 401 SENGAJA dipisah dari 429/402: 401 berarti kunci API
+            -- tidak valid/ditolak server (salah ketik, dicabut, dsb), bukan
+            -- berarti kuotanya habis — supaya pesan yang didengar pengguna
+            -- akurat dan tidak membingungkan dengan kasus kuota asli habis.
             local isLimit = false
-            if code == 429 or code == 402 or code == 401 then
+            local limitReason = nil
+            if code == 429 then
               isLimit = true
+              limitReason = "Batas laju permintaan (rate limit) Groq tercapai"
+            elseif code == 402 then
+              isLimit = true
+              limitReason = "Kredit/kuota akun Groq habis"
+            elseif code == 401 then
+              isLimit = true
+              limitReason = "Kunci API ditolak server (kemungkinan salah, tidak valid, atau sudah dicabut — BUKAN limit kuota)"
             elseif content and content ~= "" then
               local lc = string.lower(tostring(content))
               if lc:find("rate_limit")
@@ -787,11 +833,30 @@ local function sendGroqChat(userText, mediaData, onComplete)
                 or lc:find("tokens per minute")
                 or lc:find("requests per minute") then
                 isLimit = true
+                limitReason = "Token/kuota terdeteksi habis dari pesan server"
               end
             end
 
             if isLimit then
-              switchToNextKey("Token/kuota pada " .. keyLabel .. " telah habis atau limit.")
+              -- Sertakan pesan ASLI dari server Groq (jika ada) — pesan ini
+              -- biasanya secara eksplisit menyebutkan jenis batasnya (per
+              -- menit / per hari / kredit) dan kapan boleh coba lagi,
+              -- sehingga penyebab sebenarnya tidak perlu ditebak lagi.
+              local serverMsg = nil
+              pcall(function()
+                if content and content ~= "" then
+                  local errObj = JSONObject(content).optJSONObject("error")
+                  if errObj then
+                    local m = errObj.optString("message")
+                    if m and m ~= "" then serverMsg = m end
+                  end
+                end
+              end)
+              local fullReason = limitReason .. " pada " .. keyLabel
+              if serverMsg then
+                fullReason = fullReason .. ". Pesan server: " .. serverMsg
+              end
+              switchToNextKey(fullReason .. ".")
               return
             end
 
@@ -811,18 +876,20 @@ local function sendGroqChat(userText, mediaData, onComplete)
       end
 
       -- ====================================================================
-      -- WATCHDOG TIMEOUT 15 DETIK
-      -- Jika dalam 15 detik belum ada respons sama sekali (baik lewat
-      -- httpEngine.post maupun koneksi manual java.net), anggap permintaan
-      -- ini gagal (kode -1) dan lanjut ke logika penanganan biasa
-      -- (retry / pindah kunci cadangan) alih-alih diam menunggu selamanya.
-      -- Mekanisme ini disamakan dengan skrip "Deskripsi kamera Groq".
+      -- WATCHDOG TIMEOUT (20 detik foto/teks, 30 detik mode video)
+      -- Jika belum ada respons sama sekali dalam batas waktu ini (baik
+      -- lewat httpEngine.post maupun koneksi manual java.net), anggap
+      -- permintaan ini gagal (kode -1) dan lanjut ke logika penanganan
+      -- biasa (retry / pindah kunci cadangan) alih-alih diam menunggu
+      -- selamanya. Batas dibedakan per mode karena payload & waktu proses
+      -- vision model untuk video (3 frame + max_tokens besar) wajar lebih
+      -- lama daripada satu foto/teks biasa.
       -- ====================================================================
       mainHandler.postDelayed(Runnable{
         run = function()
           handleResult(-1, nil)
         end
-      }, REQUEST_TIMEOUT_MS)
+      }, requestTimeoutMs)
 
       local httpEngine = http or Http
       local dispatched = false
@@ -860,10 +927,12 @@ local function sendGroqChat(userText, mediaData, onComplete)
               conn.setRequestProperty("Authorization", "Bearer " .. activeKey)
               conn.setDoOutput(true)
               conn.setDoInput(true)
-              -- Batas koneksi & baca disesuaikan agar total tetap berada
-              -- di sekitar batas watchdog 15 detik di atas.
-              conn.setConnectTimeout(5000)
-              conn.setReadTimeout(10000)
+              -- Batas koneksi & baca disesuaikan agar total tetap sedikit
+              -- di bawah batas watchdog tersempit (20 detik untuk mode
+              -- foto/teks) supaya watchdog jarang perlu turun tangan pada
+              -- jalur koneksi manual ini.
+              conn.setConnectTimeout(6000)
+              conn.setReadTimeout(12000)
 
               local outStream = conn.getOutputStream()
               outStream.write(postData)
