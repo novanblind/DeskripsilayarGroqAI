@@ -39,7 +39,7 @@ local mainHandler = Handler(Looper.getMainLooper())
 -- ====================================================================
 -- KONFIGURASI VERSI & GITHUB AUTO-UPDATE
 -- ====================================================================
-local CURRENT_VERSION = "2.0.9"
+local CURRENT_VERSION = "2.1.0"
 local GITHUB_RAW_URL = "https://raw.githubusercontent.com/novanblind/DeskripsilayarGroqAI/main/groq_vision.lua"
 
 local defaultImageInstruction = [[DILARANG KERAS menggunakan kalimat pengantar, pembuka, atau basa-basi apa pun seperti 'Berdasarkan gambar...', 'Berikut adalah...', 'Gambar ini memperlihatkan...', atau sejenisnya. 
@@ -208,7 +208,7 @@ local function setScanMode(m) sp.edit().putString("scan_feature_mode", m).apply(
 local function getVideoDuration() return sp.getInt("video_duration", 10) end
 local function setVideoDuration(d) sp.edit().putInt("video_duration", d).apply() end
 
-local function getResolutionMode() return sp.getString("scan_resolution", "720") end
+local function getResolutionMode() return sp.getString("scan_resolution", "480") end
 local function setResolutionMode(r) sp.edit().putString("scan_resolution", r).apply() end
 
 local function getImageInstruction() return sp.getString("custom_instruction", defaultImageInstruction) end
@@ -1340,12 +1340,12 @@ local function showResolutionDialog()
   local resolutionOptions = {
     "Paling Tinggi - Resolusi Asli Layar (Paling Tajam)",
     "Tinggi - 1080p (Sangat Tajam & Jelas)",
-    "Sedang - 720p (Seimbang & Cepat - Bawaan)",
-    "Rendah - 480p (Hemat Kuota & Super Cepat)"
+    "Sedang - 720p (Seimbang & Cepat)",
+    "Rendah - 480p (Hemat Kuota & Super Cepat - Bawaan)"
   }
 
   local curRes = getResolutionMode()
-  local selectedIndex = 2
+  local selectedIndex = 3
   if curRes == "original" then selectedIndex = 0
   elseif curRes == "1080" then selectedIndex = 1
   elseif curRes == "720" then selectedIndex = 2
@@ -1461,7 +1461,7 @@ showMainMenu = function()
     ["720"] = "720p",
     ["480"] = "480p"
   }
-  local currentResText = resLabels[getResolutionMode()] or "720p"
+  local currentResText = resLabels[getResolutionMode()] or "480p"
   local currentModelText = getModelName()
   local effortLabels = {
     ["none"] = "Instruct (cepat)",
