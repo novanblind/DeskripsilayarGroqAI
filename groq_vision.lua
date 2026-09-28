@@ -563,11 +563,11 @@ end
 -- GROQ API ASINKRON DENGAN DUKUNGAN KUNCI UTAMA & CADANGAN OTOMATIS
 -- (mekanisme rotasi kunci sama dengan skrip "Deskripsi kamera Groq")
 -- ====================================================================
--- Batas waktu tunggu dasar (mode foto/teks biasa). Mode Deskripsi Video
--- memakai batas lebih longgar (lihat requestTimeoutMs di bawah) karena
--- payload gambar gabungan 3 frame + max_tokens yang lebih besar (3000)
--- wajar butuh waktu proses lebih lama dari satu foto biasa.
-local REQUEST_TIMEOUT_MS = 20000
+-- Batas waktu tunggu dasar (mode foto/teks biasa): 15 detik. Mode
+-- Deskripsi Video memakai batas lebih longgar (lihat requestTimeoutMs
+-- di bawah) karena payload gambar gabungan 3 frame + max_tokens yang
+-- lebih besar wajar butuh waktu proses lebih lama dari satu foto biasa.
+local REQUEST_TIMEOUT_MS = 15000
 local REQUEST_TIMEOUT_MS_VIDEO = 30000
 
 local function sendGroqChat(userText, mediaData, onComplete)
@@ -689,7 +689,7 @@ local function sendGroqChat(userText, mediaData, onComplete)
   local endpoint = "https://api.groq.com/openai/v1/chat/completions"
 
   -- Mode video mengirim gambar gabungan 3 frame (lebih besar) dan minta
-  -- max_tokens lebih besar (3000), jadi diberi jatah waktu tunggu lebih
+  -- max_tokens lebih besar, jadi diberi jatah waktu tunggu lebih
   -- panjang daripada mode foto/teks biasa agar tidak salah dianggap
   -- "gagal" padahal Groq masih memproses secara wajar.
   local requestTimeoutMs = (scanMode == "video_desc") and REQUEST_TIMEOUT_MS_VIDEO or REQUEST_TIMEOUT_MS
@@ -747,7 +747,7 @@ local function sendGroqChat(userText, mediaData, onComplete)
       attempt = attempt + 1
 
       -- Penanda agar hasil (baik dari respon asli maupun dari watchdog
-      -- timeout 15 detik) hanya diproses SATU KALI. Ini mencegah pesan
+      -- timeout) hanya diproses SATU KALI. Ini mencegah pesan
       -- ganda / logika ganda jika respon lambat tetap datang setelah
       -- timeout sudah dianggap gagal.
       local requestSettled = false
@@ -876,7 +876,7 @@ local function sendGroqChat(userText, mediaData, onComplete)
       end
 
       -- ====================================================================
-      -- WATCHDOG TIMEOUT (20 detik foto/teks, 30 detik mode video)
+      -- WATCHDOG TIMEOUT (15 detik foto/teks, 30 detik mode video)
       -- Jika belum ada respons sama sekali dalam batas waktu ini (baik
       -- lewat httpEngine.post maupun koneksi manual java.net), anggap
       -- permintaan ini gagal (kode -1) dan lanjut ke logika penanganan
@@ -927,12 +927,12 @@ local function sendGroqChat(userText, mediaData, onComplete)
               conn.setRequestProperty("Authorization", "Bearer " .. activeKey)
               conn.setDoOutput(true)
               conn.setDoInput(true)
-              -- Batas koneksi & baca disesuaikan agar total tetap sedikit
-              -- di bawah batas watchdog tersempit (20 detik untuk mode
-              -- foto/teks) supaya watchdog jarang perlu turun tangan pada
-              -- jalur koneksi manual ini.
-              conn.setConnectTimeout(6000)
-              conn.setReadTimeout(12000)
+              -- Batas koneksi & baca disesuaikan agar total tetap di
+              -- bawah batas watchdog tersempit (15 detik untuk mode
+              -- foto/teks) supaya watchdog jarang perlu turun tangan
+              -- pada jalur koneksi manual ini.
+              conn.setConnectTimeout(5000)
+              conn.setReadTimeout(10000)
 
               local outStream = conn.getOutputStream()
               outStream.write(postData)
